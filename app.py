@@ -116,7 +116,10 @@ def parse_ups_invoice(pdf_file) -> pd.DataFrame:
                 full_text += t + "\n"
 
     lines = full_text.split("\n")
+    records = []
 
+    # --- Format 1: Outbound invoices (Specifikation sections) ---
+    # Pattern: Mottagare: ... COUNTRY → Total kostnad för sändning TRACKING SEK ...
     mottagare_re = re.compile(r"Mottagare:\s+.+\s(\S+)\s*$")
     total_re = re.compile(
         r"Total kostnad för sändning\s+(\S+)\s+SEK\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)"
@@ -125,9 +128,7 @@ def parse_ups_invoice(pdf_file) -> pd.DataFrame:
         r"Total kostnad för sändning\s+(\S+)\s+SEK\s+([\d.,]+)\s+([\d.,]+)\s*$"
     )
 
-    records = []
     current_country = None
-
     for line in lines:
         mm = mottagare_re.search(line)
         if mm:
@@ -141,6 +142,7 @@ def parse_ups_invoice(pdf_file) -> pd.DataFrame:
                     "Land": current_country,
                     "Belopp (SEK)": parse_swedish_number(tm.group(4)),
                     "Kolli": 1,
+                    "Typ": "Utgående",
                     "Detalj": tm.group(1),
                 })
                 current_country = None
@@ -152,7 +154,55 @@ def parse_ups_invoice(pdf_file) -> pd.DataFrame:
                     "Land": current_country,
                     "Belopp (SEK)": parse_swedish_number(tm2.group(3)),
                     "Kolli": 1,
+                    "Typ": "Utgående",
                     "Detalj": tm2.group(1),
+                })
+                current_country = None
+
+    # --- Format 2: Returns invoices (UPS Returns / import / undeliverable) ---
+    # Pattern: Skickat från: NAME CITY POSTAL COUNTRY → Totalkostnad SEK ...
+    skickat_re = re.compile(r"Skickat från:.*\s([A-ZÅÄÖÜ][A-ZÅÄÖÜ\s]+)\s*$")
+    avsandare_re = re.compile(r"Avsändare:.*\s([A-ZÅÄÖÜ][A-ZÅÄÖÜ\s]+)\s*$")
+    totalkostnad_re = re.compile(
+        r"Totalkostnad\s+SEK\s+[\d.,]+\s+(?:[\d.,]+\s+)?[\d.,]+\s+([\d.,]+)\s*$"
+    )
+
+    current_country = None
+    current_section = None
+
+    for line in lines:
+        s = line.strip()
+
+        # Track section type
+        if "UPS Returns" in s:
+            current_section = "Retur"
+        elif "importsändningar" in s.lower():
+            current_section = "Retur"
+        elif "icke levererbara returer" in s.lower():
+            current_section = "Retur"
+        elif "upphämtningsbegäran" in s.lower():
+            current_section = "Övrigt"
+
+        # Origin country from "Skickat från:" or "Avsändare:"
+        sm = skickat_re.search(line)
+        if sm:
+            current_country = normalize_country(sm.group(1))
+            continue
+        am = avsandare_re.search(line)
+        if am:
+            current_country = normalize_country(am.group(1))
+            continue
+
+        # Totalkostnad line
+        if "Totalkostnad" in line and "SEK" in line and current_country:
+            tm = totalkostnad_re.search(line)
+            if tm:
+                records.append({
+                    "Land": current_country,
+                    "Belopp (SEK)": parse_swedish_number(tm.group(1)),
+                    "Kolli": 1,
+                    "Typ": current_section or "Retur",
+                    "Detalj": current_section or "Retur",
                 })
                 current_country = None
 
@@ -210,6 +260,7 @@ def parse_bring_invoice(pdf_file) -> pd.DataFrame:
                 "Land": normalize_country(customer),
                 "Belopp (SEK)": amount,
                 "Kolli": qty,
+                "Typ": "Retur" if is_return else "Utgående",
                 "Detalj": service,
             })
 
@@ -270,6 +321,7 @@ def parse_dhl_freight_invoice(pdf_file) -> pd.DataFrame:
                     "Land": "Sverige",
                     "Belopp (SEK)": amount,
                     "Kolli": kolli,
+                    "Typ": "Retur" if current_service == "Servpoint C2B" else "Utgående",
                     "Detalj": f"{current_service} → {current_city or '?'}",
                 })
                 current_service = None
@@ -289,6 +341,7 @@ def parse_dhl_freight_invoice(pdf_file) -> pd.DataFrame:
                 "Land": "Sverige",
                 "Belopp (SEK)": amount,
                 "Kolli": count,
+                "Typ": "Retur" if "C2B" in m.group(1).upper() else "Utgående",
                 "Detalj": service,
             })
 
@@ -368,6 +421,33 @@ if uploaded_file is not None:
     col2.metric("Kolli", f"{total_parcels:,}")
     col3.metric("Länder", f"{n_countries}")
     col4.metric("Snitt / kolli", f"{avg_per_parcel:,.1f} SEK")
+
+    # ── Type split (Utgående / Retur / Övrigt) ───────────────────────────
+    if "Typ" in df.columns and df["Typ"].nunique() > 0:
+        st.markdown("---")
+        st.subheader("Uppdelning per typ")
+
+        type_agg = (
+            df.groupby("Typ")
+            .agg(
+                Kolli=("Kolli", "sum"),
+                Rader=("Belopp (SEK)", "count"),
+                **{"Belopp (SEK)": ("Belopp (SEK)", "sum")},
+            )
+            .sort_values("Belopp (SEK)", ascending=False)
+            .reset_index()
+        )
+        type_agg["Andel"] = (type_agg["Belopp (SEK)"] / total_amount * 100).round(1)
+
+        # Show as metric cards
+        type_cols = st.columns(len(type_agg))
+        for i, row in type_agg.iterrows():
+            with type_cols[i]:
+                st.metric(
+                    row["Typ"],
+                    f"{row['Belopp (SEK)']:,.0f} SEK",
+                    f"{row['Andel']:.1f}% — {int(row['Kolli']):,} kolli",
+                )
 
     # ── Country breakdown ────────────────────────────────────────────────
     st.markdown("---")
