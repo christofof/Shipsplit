@@ -453,58 +453,108 @@ if uploaded_file is not None:
     st.markdown("---")
     st.subheader("Fördelning per land")
 
-    country_agg = (
-        df.groupby("Land")
-        .agg(
-            Kolli=("Kolli", "sum"),
-            Rader=("Belopp (SEK)", "count"),
-            **{"Belopp (SEK)": ("Belopp (SEK)", "sum")},
-        )
-        .sort_values("Belopp (SEK)", ascending=False)
-        .reset_index()
-    )
-    country_agg["Andel"] = (country_agg["Belopp (SEK)"] / total_amount * 100).round(1)
-    country_agg["Snitt / kolli (SEK)"] = (
-        country_agg["Belopp (SEK)"] / country_agg["Kolli"]
-    ).round(1)
+    has_types = "Typ" in df.columns and df["Typ"].nunique() > 1
 
-    # ── Charts ───────────────────────────────────────────────────────────
+    # Build cross-tab: Land × Typ
+    if has_types:
+        # Pivot: amount per country per type
+        pivot_amount = df.pivot_table(
+            index="Land", columns="Typ", values="Belopp (SEK)",
+            aggfunc="sum", fill_value=0,
+        )
+        pivot_kolli = df.pivot_table(
+            index="Land", columns="Typ", values="Kolli",
+            aggfunc="sum", fill_value=0,
+        )
+
+        # Ensure standard column order
+        type_order = [t for t in ["Utgående", "Retur", "Övrigt"] if t in pivot_amount.columns]
+        pivot_amount = pivot_amount.reindex(columns=type_order, fill_value=0)
+        pivot_kolli = pivot_kolli.reindex(columns=type_order, fill_value=0)
+
+        pivot_amount["Totalt"] = pivot_amount.sum(axis=1)
+        pivot_kolli["Totalt kolli"] = pivot_kolli.sum(axis=1)
+        pivot_amount["Andel"] = (pivot_amount["Totalt"] / total_amount * 100).round(1)
+
+        country_table = pivot_amount.sort_values("Totalt", ascending=False).reset_index()
+        country_table["Kolli"] = pivot_kolli.sort_values("Totalt kolli", ascending=False)["Totalt kolli"].values
+    else:
+        country_table = (
+            df.groupby("Land")
+            .agg(Kolli=("Kolli", "sum"), **{"Totalt": ("Belopp (SEK)", "sum")})
+            .sort_values("Totalt", ascending=False)
+            .reset_index()
+        )
+        country_table["Andel"] = (country_table["Totalt"] / total_amount * 100).round(1)
+
+    # ── Stacked bar chart ────────────────────────────────────────────────
     chart_col1, chart_col2 = st.columns([3, 2])
 
     with chart_col1:
-        fig_bar = px.bar(
-            country_agg.sort_values("Belopp (SEK)", ascending=True),
-            x="Belopp (SEK)", y="Land", orientation="h",
-            text="Belopp (SEK)", color="Belopp (SEK)",
-            color_continuous_scale=["#c6dbef", "#2171b5"],
-        )
-        fig_bar.update_traces(
-            texttemplate="%{text:,.0f}", textposition="outside", textfont_size=11,
-        )
-        fig_bar.update_layout(
-            title="Kostnad per land (SEK)",
-            xaxis_title="", yaxis_title="",
-            coloraxis_showscale=False,
-            height=max(400, n_countries * 30 + 100),
-            margin=dict(l=10, r=80, t=40, b=20),
-            font=dict(family="DM Sans, sans-serif"),
-        )
+        if has_types:
+            chart_data = country_table.sort_values("Totalt", ascending=True)
+            fig_bar = px.bar(
+                chart_data.melt(
+                    id_vars=["Land"],
+                    value_vars=type_order,
+                    var_name="Typ",
+                    value_name="SEK",
+                ),
+                x="SEK", y="Land", color="Typ", orientation="h",
+                color_discrete_map={
+                    "Utgående": "#2171b5",
+                    "Retur": "#cb4b16",
+                    "Övrigt": "#999999",
+                },
+                text="SEK",
+            )
+            fig_bar.update_traces(
+                texttemplate="%{text:,.0f}", textposition="inside", textfont_size=10,
+            )
+            fig_bar.update_layout(
+                title="Kostnad per land & typ (SEK)",
+                xaxis_title="", yaxis_title="",
+                barmode="stack",
+                height=max(400, n_countries * 30 + 100),
+                margin=dict(l=10, r=20, t=40, b=20),
+                font=dict(family="DM Sans, sans-serif"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+        else:
+            fig_bar = px.bar(
+                country_table.sort_values("Totalt", ascending=True),
+                x="Totalt", y="Land", orientation="h",
+                text="Totalt", color="Totalt",
+                color_continuous_scale=["#c6dbef", "#2171b5"],
+            )
+            fig_bar.update_traces(
+                texttemplate="%{text:,.0f}", textposition="outside", textfont_size=11,
+            )
+            fig_bar.update_layout(
+                title="Kostnad per land (SEK)",
+                xaxis_title="", yaxis_title="",
+                coloraxis_showscale=False,
+                height=max(400, n_countries * 30 + 100),
+                margin=dict(l=10, r=80, t=40, b=20),
+                font=dict(family="DM Sans, sans-serif"),
+            )
         st.plotly_chart(fig_bar, use_container_width=True)
 
     with chart_col2:
         top_n = 8
-        if len(country_agg) > top_n:
-            top = country_agg.head(top_n).copy()
-            other_sum = country_agg.iloc[top_n:]["Belopp (SEK)"].sum()
-            other_row = pd.DataFrame([{"Land": "Övriga", "Belopp (SEK)": other_sum}])
+        totals_col = "Totalt"
+        if len(country_table) > top_n:
+            top = country_table.head(top_n).copy()
+            other_sum = country_table.iloc[top_n:][totals_col].sum()
+            other_row = pd.DataFrame([{"Land": "Övriga", totals_col: other_sum}])
             pie_data = pd.concat(
-                [top[["Land", "Belopp (SEK)"]], other_row], ignore_index=True
+                [top[["Land", totals_col]], other_row], ignore_index=True
             )
         else:
-            pie_data = country_agg[["Land", "Belopp (SEK)"]].copy()
+            pie_data = country_table[["Land", totals_col]].copy()
 
         fig_pie = px.pie(
-            pie_data, values="Belopp (SEK)", names="Land",
+            pie_data, values=totals_col, names="Land",
             color_discrete_sequence=px.colors.qualitative.Set2,
         )
         fig_pie.update_traces(
@@ -521,17 +571,24 @@ if uploaded_file is not None:
     st.markdown("---")
     st.subheader("Detaljerad tabell")
 
-    display_df = country_agg.copy()
-    display_df["Belopp (SEK)"] = display_df["Belopp (SEK)"].map("{:,.0f}".format)
-    display_df["Andel"] = display_df["Andel"].map("{:.1f}%".format)
-    display_df["Snitt / kolli (SEK)"] = display_df["Snitt / kolli (SEK)"].map("{:,.1f}".format)
+    display_df = country_table.copy()
+    # Format number columns
+    for col in display_df.columns:
+        if col in ("Land",):
+            continue
+        if col == "Andel":
+            display_df[col] = display_df[col].map("{:.1f}%".format)
+        elif col == "Kolli":
+            display_df[col] = display_df[col].astype(int)
+        else:
+            display_df[col] = display_df[col].map(
+                lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else x
+            )
 
     st.dataframe(
         display_df, use_container_width=True, hide_index=True,
         column_config={
             "Land": st.column_config.TextColumn("Land", width="medium"),
-            "Kolli": st.column_config.NumberColumn("Kolli", width="small"),
-            "Rader": st.column_config.NumberColumn("Fakturarader", width="small"),
         },
     )
 
@@ -540,7 +597,7 @@ if uploaded_file is not None:
     dl_col1, dl_col2 = st.columns(2)
 
     with dl_col1:
-        csv_summary = country_agg.to_csv(index=False, sep=";", decimal=",")
+        csv_summary = country_table.to_csv(index=False, sep=";", decimal=",")
         st.download_button(
             "📥 Ladda ner sammanfattning (CSV)",
             csv_summary,
