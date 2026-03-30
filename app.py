@@ -96,7 +96,11 @@ def detect_carrier(text: str) -> str:
         return "UPS"
     if "bring" in lower and ("pickup parcel" in lower or "bring e-commerce" in lower):
         return "Bring"
-    if "dhl" in lower and ("waybill" in lower or "fraktsedel" in lower or "shipment" in lower):
+    if "dhl" in lower:
+        if "dhl freight" in lower or "fraktsedelsnr" in lower or "servpoint" in lower:
+            return "DHL Freight"
+        if "waybill" in lower or "shipment" in lower or "express" in lower:
+            return "DHL Express"
         return "DHL"
     return "Unknown"
 
@@ -214,9 +218,72 @@ def parse_bring_invoice(pdf_file) -> pd.DataFrame:
 
 # ─── DHL Parser (stub) ─────────────────────────────────────────────────────
 
-def parse_dhl_invoice(pdf_file) -> pd.DataFrame:
+def parse_dhl_freight_invoice(pdf_file) -> pd.DataFrame:
+    st.info(
+        "ℹ️ DHL Freight-faktura identifierad. Denna faktura innehåller enbart "
+        "inrikes sändningar (Sverige). Landsfördelning visar 100% Sverige."
+    )
+    # All DHL Freight Lekmera invoices are domestic SE → SE
+    # Still parse the TOTALT amounts from specification pages for a useful summary
+    with pdfplumber.open(pdf_file) as pdf:
+        full_text = ""
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                full_text += t + "\n"
+
+    lines = full_text.split("\n")
+
+    # Parse TOTALT amounts from specification pages (rightmost number on D-lines)
+    total_re = re.compile(r"([\d,]+)\s*$")
+    records = []
+    current_service = None
+    current_city = None
+
+    for line in lines:
+        stripped = line.strip()
+        # A-line: tracking + service + origin city
+        if stripped.startswith("A ") and ("SERVPOINT" in stripped or "HOME DELIVERY" in stripped):
+            if "SERVPOINT B2C" in stripped:
+                current_service = "Servpoint B2C"
+            elif "SERVPOINT C2B" in stripped:
+                current_service = "Servpoint C2B"
+            elif "HOME DELIVERY" in stripped:
+                current_service = "Home Delivery"
+            else:
+                current_service = "Övrigt"
+            # City is after the service name
+            parts = stripped.split("JÖNKÖPING")
+            if len(parts) > 1:
+                # weight is at end, city comes after JÖNKÖPING on B-line
+                pass
+        # B-line: has destination city
+        if stripped.startswith("B ") and current_service:
+            parts = stripped.split()
+            if len(parts) >= 2:
+                current_city = parts[1]  # city name
+
+        # TOTALT amount line (appears after D-line with km distance)
+        if current_service and current_city:
+            m = re.search(r"(\d+,\d{2})\s*$", stripped)
+            if m and not stripped.startswith(("A ", "B ", "C ", "D ")):
+                amount = float(m.group(1).replace(",", "."))
+                if amount > 5:  # filter out tiny noise
+                    records.append({
+                        "Land": "Sverige",
+                        "Belopp (SEK)": amount,
+                        "Kolli": 1,
+                        "Detalj": f"{current_service} → {current_city}",
+                    })
+                    current_service = None
+                    current_city = None
+
+    return pd.DataFrame(records)
+
+
+def parse_dhl_express_invoice(pdf_file) -> pd.DataFrame:
     st.warning(
-        "⚠️ DHL-parsern är inte implementerad än. "
+        "⚠️ DHL Express-parsern är inte implementerad än. "
         "Ladda upp en exempelfaktura så bygger vi stöd för den."
     )
     return pd.DataFrame()
@@ -261,8 +328,12 @@ if uploaded_file is not None:
             df = parse_ups_invoice(uploaded_file)
         elif carrier == "Bring":
             df = parse_bring_invoice(uploaded_file)
+        elif carrier == "DHL Freight":
+            df = parse_dhl_freight_invoice(uploaded_file)
+        elif carrier == "DHL Express":
+            df = parse_dhl_express_invoice(uploaded_file)
         elif carrier == "DHL":
-            df = parse_dhl_invoice(uploaded_file)
+            df = parse_dhl_express_invoice(uploaded_file)
         else:
             df = pd.DataFrame()
 
@@ -411,6 +482,10 @@ if uploaded_file is not None:
             "ℹ️ Alla fakturarader ingår i analysen. Kundlandet bestäms av "
             "destinationsland för utgående sändningar och avsändarland för returer."
         )
+    elif carrier == "DHL Freight":
+        st.caption(
+            "ℹ️ DHL Freight — inrikes sändningar. Alla leveranser är inom Sverige."
+        )
 
 else:
     st.markdown("""
@@ -422,5 +497,6 @@ else:
     Stödjer för närvarande:
     - ✅ **UPS** — fullständigt stöd (svenska fakturor)
     - ✅ **Bring** — fullständigt stöd
-    - 🔧 **DHL** — under utveckling
+    - ✅ **DHL Freight** — inrikes (identifieras korrekt)
+    - 🔧 **DHL Express** — under utveckling
     """)
