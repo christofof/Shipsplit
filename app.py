@@ -206,7 +206,21 @@ def parse_ups_invoice(pdf_file) -> pd.DataFrame:
                 })
                 current_country = None
 
-    return pd.DataFrame(records)
+    # Extract invoice total (ex VAT) from page 1 summary
+    invoice_total = None
+    momspliktigt = 0.0
+    icke_moms = 0.0
+    for line in lines:
+        m = re.search(r"Totalt momspliktigt\s+([\d.,]+)", line)
+        if m:
+            momspliktigt = parse_swedish_number(m.group(1))
+        m2 = re.search(r"Icke momspliktigt\s+([\d.,]+)", line)
+        if m2:
+            icke_moms = parse_swedish_number(m2.group(1))
+    if momspliktigt > 0 or icke_moms > 0:
+        invoice_total = momspliktigt + icke_moms
+
+    return pd.DataFrame(records), invoice_total
 
 
 # ─── Bring Parser ───────────────────────────────────────────────────────────
@@ -264,7 +278,13 @@ def parse_bring_invoice(pdf_file) -> pd.DataFrame:
                 "Detalj": service,
             })
 
-    return pd.DataFrame(records)
+    # Extract invoice total from "Summa exkl. moms"
+    invoice_total = None
+    m = re.search(r"Summa exkl\.?\s*moms\s+([\d\s.,]+)", full_text)
+    if m:
+        invoice_total = parse_swedish_number(m.group(1))
+
+    return pd.DataFrame(records), invoice_total
 
 
 # ─── DHL Parser (stub) ─────────────────────────────────────────────────────
@@ -345,7 +365,19 @@ def parse_dhl_freight_invoice(pdf_file) -> pd.DataFrame:
                 "Detalj": service,
             })
 
-    return pd.DataFrame(records)
+    # Extract invoice total from page 1 summary
+    invoice_total = None
+    # DHL Freight: "Summa exkl. moms" or "TOTAL" line with SEK amount
+    m = re.search(r"Summa exkl\.?\s*moms\s+([\d\s.,]+)", full_text)
+    if m:
+        invoice_total = parse_swedish_number(m.group(1))
+    else:
+        # Fallback: "Momspliktigt belopp SEK AMOUNT" on page 1
+        m2 = re.search(r"Momspliktigt belopp\s+SEK\s+([\d\s.,]+)", full_text)
+        if m2:
+            invoice_total = parse_swedish_number(m2.group(1))
+
+    return pd.DataFrame(records), invoice_total
 
 
 def parse_dhl_express_invoice(pdf_file) -> pd.DataFrame:
@@ -353,7 +385,7 @@ def parse_dhl_express_invoice(pdf_file) -> pd.DataFrame:
         "⚠️ DHL Express-parsern är inte implementerad än. "
         "Ladda upp en exempelfaktura så bygger vi stöd för den."
     )
-    return pd.DataFrame()
+    return pd.DataFrame(), None
 
 
 # ─── Main UI ────────────────────────────────────────────────────────────────
@@ -391,16 +423,17 @@ if uploaded_file is not None:
     st.info(f"🔍 Identifierat: **{carrier}**-faktura. Analyserar...")
 
     with st.spinner("Extraherar data från PDF..."):
+        invoice_total = None
         if carrier == "UPS":
-            df = parse_ups_invoice(uploaded_file)
+            df, invoice_total = parse_ups_invoice(uploaded_file)
         elif carrier == "Bring":
-            df = parse_bring_invoice(uploaded_file)
+            df, invoice_total = parse_bring_invoice(uploaded_file)
         elif carrier == "DHL Freight":
-            df = parse_dhl_freight_invoice(uploaded_file)
+            df, invoice_total = parse_dhl_freight_invoice(uploaded_file)
         elif carrier == "DHL Express":
-            df = parse_dhl_express_invoice(uploaded_file)
+            df, invoice_total = parse_dhl_express_invoice(uploaded_file)
         elif carrier == "DHL":
-            df = parse_dhl_express_invoice(uploaded_file)
+            df, invoice_total = parse_dhl_express_invoice(uploaded_file)
         else:
             df = pd.DataFrame()
 
@@ -502,6 +535,25 @@ if uploaded_file is not None:
         )
         country_table["Andel"] = (country_table["Totalt"] / total_amount * 100).round(1)
         country_table["Snitt totalt"] = (country_table["Totalt"] / country_table["Kolli"]).round(1)
+
+    # ── Add "Ej allokerat" row if invoice total is known ─────────────────
+    parsed_total = country_table["Totalt"].sum()
+    if invoice_total and invoice_total > parsed_total + 1:
+        gap = round(invoice_total - parsed_total, 2)
+        gap_row = {"Land": "Ej allokerat", "Totalt": gap, "Kolli": 0,
+                   "Andel": round(gap / invoice_total * 100, 1),
+                   "Snitt totalt": 0.0}
+        if has_types:
+            for typ in type_order:
+                gap_row[typ] = 0.0
+                gap_row[f"Snitt {typ.lower()}"] = 0.0
+        country_table = pd.concat(
+            [country_table, pd.DataFrame([gap_row])], ignore_index=True
+        )
+        # Recalculate Andel based on invoice total
+        country_table["Andel"] = (
+            country_table["Totalt"] / invoice_total * 100
+        ).round(1)
 
     # ── Stacked bar chart ────────────────────────────────────────────────
     chart_col1, chart_col2 = st.columns([3, 2])
@@ -638,20 +690,17 @@ if uploaded_file is not None:
         )
 
     # ── Footer ───────────────────────────────────────────────────────────
-    if carrier == "UPS":
+    if invoice_total and invoice_total > parsed_total + 1:
         st.caption(
-            "ℹ️ Analysen baseras på specifikationssektionerna i fakturan. "
-            "Adressändringar, korrigeringar och justeringar som inte är knutna "
-            "till en specifik sändning ingår inte i landsfördelningen."
+            f"ℹ️ Fakturans totalbelopp exkl. moms: **{invoice_total:,.0f} SEK**. "
+            f"Allokerat till sändningar: {parsed_total:,.0f} SEK ({parsed_total/invoice_total*100:.1f}%). "
+            f"\"Ej allokerat\" ({invoice_total - parsed_total:,.0f} SEK) avser adressändringar, "
+            f"korrigeringar, upphämtningsavgifter eller andra poster utan landskoppling."
         )
-    elif carrier == "Bring":
+    elif invoice_total:
         st.caption(
-            "ℹ️ Alla fakturarader ingår i analysen. Kundlandet bestäms av "
-            "destinationsland för utgående sändningar och avsändarland för returer."
-        )
-    elif carrier == "DHL Freight":
-        st.caption(
-            "ℹ️ DHL Freight — inrikes sändningar. Alla leveranser är inom Sverige."
+            f"ℹ️ Fakturans totalbelopp exkl. moms: {invoice_total:,.0f} SEK — "
+            f"100% allokerat till sändningar."
         )
 
 else:
