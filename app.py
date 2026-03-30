@@ -392,54 +392,82 @@ def parse_dhl_express_invoice(pdf_file) -> pd.DataFrame:
 
 st.title("📦 Shipsplit")
 st.markdown(
-    "Ladda upp en fraktfaktura (PDF) från **UPS**, **Bring** eller **DHL** "
+    "Ladda upp en eller flera fraktfakturor (PDF) från **UPS**, **Bring** eller **DHL** "
     "för att se hur kostnaden fördelas per land."
 )
 
-uploaded_file = st.file_uploader(
-    "Välj PDF-faktura",
+uploaded_files = st.file_uploader(
+    "Välj PDF-fakturor",
     type=["pdf"],
-    help="Stödjer UPS och Bring (svenska fakturor). DHL under utveckling.",
+    accept_multiple_files=True,
+    help="Stödjer UPS och Bring (svenska fakturor). DHL under utveckling. Välj en eller flera filer.",
 )
 
-if uploaded_file is not None:
-    with pdfplumber.open(uploaded_file) as pdf:
-        sample_text = ""
-        for page in pdf.pages[:3]:
-            t = page.extract_text()
-            if t:
-                sample_text += t + "\n"
+if uploaded_files:
+    all_dfs = []
+    total_invoice = 0.0
+    has_any_invoice_total = False
+    file_results = []
 
-    carrier = detect_carrier(sample_text)
-    uploaded_file.seek(0)
+    with st.spinner(f"Extraherar data från {len(uploaded_files)} faktura(or)..."):
+        for uploaded_file in uploaded_files:
+            # Detect carrier
+            with pdfplumber.open(uploaded_file) as pdf:
+                sample_text = ""
+                for page in pdf.pages[:3]:
+                    t = page.extract_text()
+                    if t:
+                        sample_text += t + "\n"
 
-    if carrier == "Unknown":
-        st.error(
-            "❌ Kunde inte identifiera fraktbolaget. "
-            "Stödjer för närvarande UPS, Bring och DHL."
-        )
+            carrier = detect_carrier(sample_text)
+            uploaded_file.seek(0)
+
+            if carrier == "Unknown":
+                file_results.append(f"⚠️ **{uploaded_file.name}** — okänt format, hoppad")
+                continue
+
+            # Parse
+            invoice_total = None
+            if carrier == "UPS":
+                df_part, invoice_total = parse_ups_invoice(uploaded_file)
+            elif carrier == "Bring":
+                df_part, invoice_total = parse_bring_invoice(uploaded_file)
+            elif carrier == "DHL Freight":
+                df_part, invoice_total = parse_dhl_freight_invoice(uploaded_file)
+            elif carrier == "DHL Express":
+                df_part, invoice_total = parse_dhl_express_invoice(uploaded_file)
+            elif carrier == "DHL":
+                df_part, invoice_total = parse_dhl_express_invoice(uploaded_file)
+            else:
+                df_part = pd.DataFrame()
+
+            if not df_part.empty:
+                df_part["Faktura"] = uploaded_file.name
+                df_part["Transportör"] = carrier
+                all_dfs.append(df_part)
+
+            if invoice_total:
+                total_invoice += invoice_total
+                has_any_invoice_total = True
+
+            n_rows = len(df_part) if not df_part.empty else 0
+            amt = df_part["Belopp (SEK)"].sum() if not df_part.empty else 0
+            file_results.append(
+                f"✅ **{uploaded_file.name}** — {carrier}, {n_rows} rader, {amt:,.0f} SEK"
+            )
+
+    # Show per-file results
+    if len(uploaded_files) > 1:
+        with st.expander(f"Filstatus ({len(uploaded_files)} fakturor)", expanded=False):
+            for msg in file_results:
+                st.markdown(msg)
+
+    if not all_dfs:
+        st.warning("Inga sändningar hittades i de uppladdade fakturorna.")
         st.stop()
 
-    st.info(f"🔍 Identifierat: **{carrier}**-faktura. Analyserar...")
-
-    with st.spinner("Extraherar data från PDF..."):
-        invoice_total = None
-        if carrier == "UPS":
-            df, invoice_total = parse_ups_invoice(uploaded_file)
-        elif carrier == "Bring":
-            df, invoice_total = parse_bring_invoice(uploaded_file)
-        elif carrier == "DHL Freight":
-            df, invoice_total = parse_dhl_freight_invoice(uploaded_file)
-        elif carrier == "DHL Express":
-            df, invoice_total = parse_dhl_express_invoice(uploaded_file)
-        elif carrier == "DHL":
-            df, invoice_total = parse_dhl_express_invoice(uploaded_file)
-        else:
-            df = pd.DataFrame()
-
-    if df.empty:
-        st.warning("Inga sändningar hittades i fakturan.")
-        st.stop()
+    df = pd.concat(all_dfs, ignore_index=True)
+    invoice_total = total_invoice if has_any_invoice_total else None
 
     # ── Summary metrics ──────────────────────────────────────────────────
     st.markdown("---")
@@ -454,6 +482,13 @@ if uploaded_file is not None:
     col2.metric("Kolli", f"{total_parcels:,}")
     col3.metric("Länder", f"{n_countries}")
     col4.metric("Snitt / kolli", f"{avg_per_parcel:,.1f} SEK")
+
+    if len(uploaded_files) > 1:
+        carriers_in_data = df["Transportör"].unique() if "Transportör" in df.columns else []
+        st.caption(
+            f"📄 {len(all_dfs)} fakturor analyserade"
+            + (f" ({', '.join(carriers_in_data)})" if len(carriers_in_data) > 0 else "")
+        )
 
     # ── Type split (Utgående / Retur / Övrigt) ───────────────────────────
     if "Typ" in df.columns and df["Typ"].nunique() > 0:
@@ -666,10 +701,11 @@ if uploaded_file is not None:
 
     with dl_col1:
         csv_summary = country_table.to_csv(index=False, sep=";", decimal=",")
+        carriers_label = "_".join(sorted(df["Transportör"].unique())).lower() if "Transportör" in df.columns else "mixed"
         st.download_button(
             "📥 Ladda ner sammanfattning (CSV)",
             csv_summary,
-            file_name=f"shipsplit_per_land_{carrier.lower()}.csv",
+            file_name=f"shipsplit_per_land_{carriers_label}.csv",
             mime="text/csv",
         )
 
@@ -678,7 +714,7 @@ if uploaded_file is not None:
         st.download_button(
             "📥 Ladda ner alla rader (CSV)",
             csv_detail,
-            file_name=f"shipsplit_detalj_{carrier.lower()}.csv",
+            file_name=f"shipsplit_detalj_{carriers_label}.csv",
             mime="text/csv",
         )
 
@@ -691,28 +727,32 @@ if uploaded_file is not None:
 
     # ── Footer ───────────────────────────────────────────────────────────
     if invoice_total and invoice_total > parsed_total + 1:
+        inv_label = "Fakturornas" if len(uploaded_files) > 1 else "Fakturans"
         st.caption(
-            f"ℹ️ Fakturans totalbelopp exkl. moms: **{invoice_total:,.0f} SEK**. "
+            f"ℹ️ {inv_label} totalbelopp exkl. moms: **{invoice_total:,.0f} SEK**. "
             f"Allokerat till sändningar: {parsed_total:,.0f} SEK ({parsed_total/invoice_total*100:.1f}%). "
             f"\"Ej allokerat\" ({invoice_total - parsed_total:,.0f} SEK) avser adressändringar, "
             f"korrigeringar, upphämtningsavgifter eller andra poster utan landskoppling."
         )
     elif invoice_total:
+        inv_label = "Fakturornas" if len(uploaded_files) > 1 else "Fakturans"
         st.caption(
-            f"ℹ️ Fakturans totalbelopp exkl. moms: {invoice_total:,.0f} SEK — "
+            f"ℹ️ {inv_label} totalbelopp exkl. moms: {invoice_total:,.0f} SEK — "
             f"100% allokerat till sändningar."
         )
 
 else:
     st.markdown("""
     ### Så här fungerar det
-    1. **Ladda upp** en fraktfaktura i PDF-format
+    1. **Ladda upp** en eller flera fraktfakturor i PDF-format (du kan välja flera samtidigt)
     2. **Automatisk analys** — systemet identifierar fraktbolaget och parsar alla rader
     3. **Se resultatet** — kostnad per land med diagram och nedladdningsbar CSV
 
     Stödjer för närvarande:
-    - ✅ **UPS** — fullständigt stöd (svenska fakturor)
+    - ✅ **UPS** — fullständigt stöd (svenska fakturor, utgående & returer)
     - ✅ **Bring** — fullständigt stöd
     - ✅ **DHL Freight** — inrikes (identifieras korrekt)
     - 🔧 **DHL Express** — under utveckling
+
+    Du kan blanda fakturor från olika transportörer i samma uppladdning.
     """)
