@@ -477,7 +477,22 @@ if uploaded_file is not None:
         pivot_amount["Andel"] = (pivot_amount["Totalt"] / total_amount * 100).round(1)
 
         country_table = pivot_amount.sort_values("Totalt", ascending=False).reset_index()
-        country_table["Kolli"] = pivot_kolli.sort_values("Totalt kolli", ascending=False)["Totalt kolli"].values
+        kolli_sorted = pivot_kolli.sort_values("Totalt kolli", ascending=False)
+        country_table["Kolli"] = kolli_sorted["Totalt kolli"].values
+
+        # Add cost-per-kolli columns
+        for typ in type_order:
+            kolli_col = kolli_sorted[typ].values
+            amount_col = country_table[typ].values
+            country_table[f"Snitt {typ.lower()}"] = [
+                round(a / k, 1) if k > 0 else 0.0
+                for a, k in zip(amount_col, kolli_col)
+            ]
+        total_kolli = kolli_sorted["Totalt kolli"].values
+        country_table["Snitt totalt"] = [
+            round(a / k, 1) if k > 0 else 0.0
+            for a, k in zip(country_table["Totalt"].values, total_kolli)
+        ]
     else:
         country_table = (
             df.groupby("Land")
@@ -486,6 +501,7 @@ if uploaded_file is not None:
             .reset_index()
         )
         country_table["Andel"] = (country_table["Totalt"] / total_amount * 100).round(1)
+        country_table["Snitt totalt"] = (country_table["Totalt"] / country_table["Kolli"]).round(1)
 
     # ── Stacked bar chart ────────────────────────────────────────────────
     chart_col1, chart_col2 = st.columns([3, 2])
