@@ -223,8 +223,6 @@ def parse_dhl_freight_invoice(pdf_file) -> pd.DataFrame:
         "ℹ️ DHL Freight-faktura identifierad. Denna faktura innehåller enbart "
         "inrikes sändningar (Sverige). Landsfördelning visar 100% Sverige."
     )
-    # All DHL Freight Lekmera invoices are domestic SE → SE
-    # Still parse the TOTALT amounts from specification pages for a useful summary
     with pdfplumber.open(pdf_file) as pdf:
         full_text = ""
         for page in pdf.pages:
@@ -233,50 +231,66 @@ def parse_dhl_freight_invoice(pdf_file) -> pd.DataFrame:
                 full_text += t + "\n"
 
     lines = full_text.split("\n")
-
-    # Parse TOTALT amounts from specification pages (rightmost number on D-lines)
-    total_re = re.compile(r"([\d,]+)\s*$")
     records = []
+
+    # Strategy 1: Parse individual shipment TOTALT from spec pages
+    # Each shipment block has A/B/C/D lines. The TOTALT appears as the last
+    # comma-decimal number on D-lines or standalone after D-lines.
     current_service = None
     current_city = None
 
     for line in lines:
-        stripped = line.strip()
-        # A-line: tracking + service + origin city
-        if stripped.startswith("A ") and ("SERVPOINT" in stripped or "HOME DELIVERY" in stripped):
-            if "SERVPOINT B2C" in stripped:
+        s = line.strip()
+
+        # A-line: service type
+        if re.match(r"^A\s+\d{3}\s", s):
+            if "SERVPOINT B2C" in s:
                 current_service = "Servpoint B2C"
-            elif "SERVPOINT C2B" in stripped:
+            elif "SERVPOINT C2B" in s:
                 current_service = "Servpoint C2B"
-            elif "HOME DELIVERY" in stripped:
+            elif "HOME DELIVERY" in s:
                 current_service = "Home Delivery"
             else:
-                current_service = "Övrigt"
-            # City is after the service name
-            parts = stripped.split("JÖNKÖPING")
-            if len(parts) > 1:
-                # weight is at end, city comes after JÖNKÖPING on B-line
-                pass
-        # B-line: has destination city
-        if stripped.startswith("B ") and current_service:
-            parts = stripped.split()
-            if len(parts) >= 2:
-                current_city = parts[1]  # city name
+                current_service = None
+            current_city = None
 
-        # TOTALT amount line (appears after D-line with km distance)
-        if current_service and current_city:
-            m = re.search(r"(\d+,\d{2})\s*$", stripped)
-            if m and not stripped.startswith(("A ", "B ", "C ", "D ")):
-                amount = float(m.group(1).replace(",", "."))
-                if amount > 5:  # filter out tiny noise
-                    records.append({
-                        "Land": "Sverige",
-                        "Belopp (SEK)": amount,
-                        "Kolli": 1,
-                        "Detalj": f"{current_service} → {current_city}",
-                    })
-                    current_service = None
-                    current_city = None
+        # B-line: destination city (third field: B fraktsedelsnr CITY ...)
+        elif re.match(r"^B\s+\d", s) and current_service:
+            parts = s.split()
+            if len(parts) >= 3:
+                current_city = parts[2]
+
+        # D-line: ends with "km_distance antal_kolli TOTALT"
+        elif re.match(r"^D\s", s) and current_service and "Tilläggs" not in s:
+            m = re.search(r"(\d+)\s+(\d+)\s+(\d+,\d{2})\s*$", s)
+            if m:
+                kolli = int(m.group(2))
+                amount = float(m.group(3).replace(",", "."))
+                records.append({
+                    "Land": "Sverige",
+                    "Belopp (SEK)": amount,
+                    "Kolli": kolli,
+                    "Detalj": f"{current_service} → {current_city or '?'}",
+                })
+                current_service = None
+                current_city = None
+
+    # Strategy 2: If spec parsing found nothing, fall back to page 1 summary
+    if not records:
+        summary_re = re.compile(
+            r"(HOME DELIVERY|SERVPOINT B2C|SERVPOINT C2B)\s+(\d+)\s+([\d\s,]+?)(?:\s*\*)?$",
+            re.MULTILINE,
+        )
+        for m in summary_re.finditer(full_text):
+            service = m.group(1).title()
+            count = int(m.group(2))
+            amount = float(m.group(3).strip().replace(" ", "").replace(",", "."))
+            records.append({
+                "Land": "Sverige",
+                "Belopp (SEK)": amount,
+                "Kolli": count,
+                "Detalj": service,
+            })
 
     return pd.DataFrame(records)
 
