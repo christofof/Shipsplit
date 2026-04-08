@@ -802,7 +802,10 @@ def page_history():
     invoices_df["period_end"] = pd.to_datetime(invoices_df["period_end"], errors="coerce")
 
     # Display date: use period if available, else upload date
-    invoices_df["display_date"] = invoices_df["period_start"].fillna(invoices_df["upload_date"])
+    invoices_df["display_date"] = pd.to_datetime(
+        invoices_df["period_start"].fillna(invoices_df["upload_date"]),
+        errors="coerce",
+    )
     invoices_df["Period"] = invoices_df.apply(
         lambda r: (f"{r['period_start'].strftime('%Y-%m-%d')} — {r['period_end'].strftime('%Y-%m-%d')}"
                    if pd.notna(r["period_start"]) and pd.notna(r["period_end"])
