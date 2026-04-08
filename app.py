@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.express as px
 import re
 import json
+import gc
 from datetime import datetime, date, timedelta
 
 # ─── Page config ────────────────────────────────────────────────────────────
@@ -110,14 +111,16 @@ def detect_carrier(text: str) -> str:
 
 
 def parse_ups_invoice(pdf_file):
+    # Extract text page by page to manage memory
+    lines = []
     with pdfplumber.open(pdf_file) as pdf:
-        full_text = ""
         for page in pdf.pages:
             t = page.extract_text()
             if t:
-                full_text += t + "\n"
+                lines.extend(t.split("\n"))
+    # PDF is now closed and memory released
 
-    lines = full_text.split("\n")
+    full_text = "\n".join(lines)  # needed for overhead regex
     records = []
 
     # Format 1: Outbound (Mottagare → Total kostnad för sändning)
@@ -786,29 +789,34 @@ def page_upload():
     msgs = []
     saved_count = 0
 
-    with st.spinner(f"Analyserar {len(uploaded_files)} faktura(or)..."):
-        for uf in uploaded_files:
-            # Duplicate check
-            if sb and check_duplicate(sb, uf.name):
-                msgs.append(f"⏭️ **{uf.name}** — redan uppladdad, hoppad")
-                continue
+    progress = st.progress(0, text="Analyserar fakturor...")
+    for file_idx, uf in enumerate(uploaded_files):
+        progress.progress((file_idx) / len(uploaded_files),
+                          text=f"Analyserar {uf.name}... ({file_idx+1}/{len(uploaded_files)})")
 
-            with pdfplumber.open(uf) as pdf:
-                sample = ""
-                for p in pdf.pages[:3]:
-                    t = p.extract_text()
-                    if t:
-                        sample += t + "\n"
+        # Duplicate check
+        if sb and check_duplicate(sb, uf.name):
+            msgs.append(f"⏭️ **{uf.name}** — redan uppladdad, hoppad")
+            continue
 
-            carrier = detect_carrier(sample)
-            uf.seek(0)
+        with pdfplumber.open(uf) as pdf:
+            sample = ""
+            for p in pdf.pages[:3]:
+                t = p.extract_text()
+                if t:
+                    sample += t + "\n"
 
-            if carrier == "Unknown":
-                msgs.append(f"⚠️ **{uf.name}** — okänt format")
-                continue
+        carrier = detect_carrier(sample)
+        del sample
+        uf.seek(0)
 
-            inv_total = None
-            overhead = []
+        if carrier == "Unknown":
+            msgs.append(f"⚠️ **{uf.name}** — okänt format")
+            continue
+
+        inv_total = None
+        overhead = []
+        try:
             if carrier == "UPS":
                 df_part, inv_total, overhead = parse_ups_invoice(uf)
             elif carrier == "Bring":
@@ -819,44 +827,53 @@ def page_upload():
                 df_part, inv_total, overhead = parse_dhl_express_invoice(uf)
             else:
                 df_part = pd.DataFrame()
+        except MemoryError:
+            msgs.append(f"❌ **{uf.name}** — för stor fil, minnet räcker inte")
+            gc.collect()
+            continue
 
-            if df_part.empty:
-                msgs.append(f"⚠️ **{uf.name}** — inga sändningar hittades")
-                continue
+        if df_part.empty:
+            msgs.append(f"⚠️ **{uf.name}** — inga sändningar hittades")
+            continue
 
-            df_part["Faktura"] = uf.name
-            df_part["Transportör"] = carrier
-            all_dfs.append(df_part)
+        df_part["Faktura"] = uf.name
+        df_part["Transportör"] = carrier
+        all_dfs.append(df_part)
 
-            if inv_total:
-                total_invoice += inv_total
-                has_any_total = True
+        if inv_total:
+            total_invoice += inv_total
+            has_any_total = True
 
-            # Collect overhead charges
-            all_overhead.extend(overhead)
+        # Collect overhead charges
+        all_overhead.extend(overhead)
 
-            # Extract dates from invoice
-            uf.seek(0)
-            dates = extract_invoice_dates(uf)
+        # Extract dates from invoice
+        uf.seek(0)
+        dates = extract_invoice_dates(uf)
 
-            # Save to database
-            if sb:
-                try:
-                    save_invoice(sb, uf.name, carrier, inv_total,
-                                 df_part["Belopp (SEK)"].sum(), df_part, dates=dates,
-                                 overhead=overhead)
-                    saved_count += 1
-                    msgs.append(
-                        f"✅ **{uf.name}** — {carrier}, {len(df_part)} rader, "
-                        f"{df_part['Belopp (SEK)'].sum():,.0f} SEK (sparad)"
-                    )
-                except Exception as e:
-                    msgs.append(f"⚠️ **{uf.name}** — parsad men kunde inte sparas: {e}")
-            else:
+        # Save to database
+        if sb:
+            try:
+                save_invoice(sb, uf.name, carrier, inv_total,
+                             df_part["Belopp (SEK)"].sum(), df_part, dates=dates,
+                             overhead=overhead)
+                saved_count += 1
                 msgs.append(
                     f"✅ **{uf.name}** — {carrier}, {len(df_part)} rader, "
-                    f"{df_part['Belopp (SEK)'].sum():,.0f} SEK"
+                    f"{df_part['Belopp (SEK)'].sum():,.0f} SEK (sparad)"
                 )
+            except Exception as e:
+                msgs.append(f"⚠️ **{uf.name}** — parsad men kunde inte sparas: {e}")
+        else:
+            msgs.append(
+                f"✅ **{uf.name}** — {carrier}, {len(df_part)} rader, "
+                f"{df_part['Belopp (SEK)'].sum():,.0f} SEK"
+            )
+
+        # Free memory before next file
+        gc.collect()
+
+    progress.empty()
 
     # Status messages
     if msgs:
