@@ -82,6 +82,9 @@ COUNTRY_NAME_MAP = {
 
 def normalize_country(raw: str) -> str:
     raw = raw.strip().upper()
+    # Guard: if raw is all digits, it's a postal code, not a country
+    if raw.isdigit():
+        return "Okänt"
     return COUNTRY_NAME_MAP.get(raw, raw.title())
 
 
@@ -199,7 +202,47 @@ def parse_ups_invoice(pdf_file):
     if momspliktigt > 0 or icke_moms > 0:
         invoice_total = momspliktigt + icke_moms
 
-    return pd.DataFrame(records), invoice_total
+    # Extract overhead charges
+    overhead = []
+    privatadress_total = 0.0
+    sasong_total = 0.0
+    adress_total = 0.0
+    justeringar_total = 0.0
+
+    for line in lines:
+        # Residential delivery surcharge
+        m = re.search(r"Totala justeringar för leveverans till privatadresser\s+SEK\s+([\d.,]+)\s+([\d.,]+)", line)
+        if m:
+            privatadress_total += parse_swedish_number(m.group(2))
+
+        # Seasonal surcharge
+        m = re.search(r"Totalkostnad för just\. av säsongsbas\. tilläggsavg\.\s+SEK\s+([\d.,]+)\s+([\d.,]+)", line)
+        if m:
+            sasong_total += parse_swedish_number(m.group(2))
+
+        # Address corrections
+        m = re.search(r"Total kostnad för adressändring\s+SEK\s+([\d.,]+)\s+([\d.,]+)", line)
+        if m:
+            adress_total += parse_swedish_number(m.group(2))
+
+        # Total adjustments (includes all sub-categories)
+        m = re.search(r"Totala justeringar\s+SEK\s+([\d.,]+)\s+([\d.,]+)", line)
+        if m:
+            justeringar_total += parse_swedish_number(m.group(2))
+
+    # Weight corrections = total justeringar minus known sub-categories
+    vikt_total = max(0, justeringar_total - privatadress_total - sasong_total)
+
+    if privatadress_total > 0:
+        overhead.append({"Kategori": "Leverans till privatadress", "Belopp (SEK)": privatadress_total})
+    if vikt_total > 0:
+        overhead.append({"Kategori": "Viktkorrigeringar", "Belopp (SEK)": vikt_total})
+    if sasong_total > 0:
+        overhead.append({"Kategori": "Säsongsbaserat tillägg", "Belopp (SEK)": sasong_total})
+    if adress_total > 0:
+        overhead.append({"Kategori": "Adressändring", "Belopp (SEK)": adress_total})
+
+    return pd.DataFrame(records), invoice_total, overhead
 
 
 def parse_bring_invoice(pdf_file):
@@ -249,7 +292,7 @@ def parse_bring_invoice(pdf_file):
     m = re.search(r"Summa exkl\.?\s*moms\s+([\d\s.,]+)", full_text)
     if m:
         invoice_total = parse_swedish_number(m.group(1))
-    return pd.DataFrame(records), invoice_total
+    return pd.DataFrame(records), invoice_total, []
 
 
 def parse_dhl_freight_invoice(pdf_file):
@@ -315,11 +358,11 @@ def parse_dhl_freight_invoice(pdf_file):
         if m2:
             invoice_total = parse_swedish_number(m2.group(1))
 
-    return pd.DataFrame(records), invoice_total
+    return pd.DataFrame(records), invoice_total, []
 
 
 def parse_dhl_express_invoice(pdf_file):
-    return pd.DataFrame(), None
+    return pd.DataFrame(), None, []
 
 
 def extract_invoice_dates(pdf_file):
@@ -487,7 +530,7 @@ def delete_invoice(sb, invoice_id):
 # SHARED ANALYSIS VIEW
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def show_analysis(df, invoice_total=None, n_files=1):
+def show_analysis(df, invoice_total=None, n_files=1, overhead=None):
     """Render the full analysis view (metrics, type split, country table, charts)."""
 
     total_amount = df["Belopp (SEK)"].sum()
@@ -647,6 +690,42 @@ def show_analysis(df, invoice_total=None, n_files=1):
             )
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+    # Overhead breakdown (if available)
+    if overhead:
+        st.markdown("---")
+        st.subheader("Övriga kostnader (ej knutna till sändningar)")
+
+        oh_df = pd.DataFrame(overhead)
+        if not oh_df.empty:
+            # Aggregate by category (in case of multiple invoices)
+            oh_agg = oh_df.groupby("Kategori")["Belopp (SEK)"].sum().reset_index()
+            oh_agg = oh_agg.sort_values("Belopp (SEK)", ascending=False)
+
+            # Display as metric cards
+            oh_total = oh_agg["Belopp (SEK)"].sum()
+            oh_cols = st.columns(min(len(oh_agg), 4))
+            for i, (_, row) in enumerate(oh_agg.iterrows()):
+                with oh_cols[i % len(oh_cols)]:
+                    pct = row["Belopp (SEK)"] / oh_total * 100 if oh_total > 0 else 0
+                    st.metric(row["Kategori"], f"{row['Belopp (SEK)']:,.0f} SEK",
+                              f"{pct:.0f}% av övriga kostnader")
+
+            # Show unaccounted remainder
+            if invoice_total:
+                overhead_accounted = oh_total
+                gap = invoice_total - parsed_total
+                remainder = gap - overhead_accounted
+                if abs(remainder) > 1:
+                    st.caption(
+                        f"Identifierade övriga kostnader: {overhead_accounted:,.0f} SEK av "
+                        f"{gap:,.0f} SEK ej allokerat. "
+                        f"Resterande {remainder:,.0f} SEK ospecificerat."
+                    )
+                else:
+                    st.caption(
+                        f"✅ Alla övriga kostnader identifierade: {overhead_accounted:,.0f} SEK."
+                    )
+
     # Downloads
     st.markdown("---")
     dl1, dl2 = st.columns(2)
@@ -700,6 +779,7 @@ def page_upload():
     all_dfs = []
     total_invoice = 0.0
     has_any_total = False
+    all_overhead = []
     msgs = []
     saved_count = 0
 
@@ -708,7 +788,6 @@ def page_upload():
             # Duplicate check
             if sb and check_duplicate(sb, uf.name):
                 msgs.append(f"⏭️ **{uf.name}** — redan uppladdad, hoppad")
-                # Load existing data for this file
                 continue
 
             with pdfplumber.open(uf) as pdf:
@@ -726,14 +805,15 @@ def page_upload():
                 continue
 
             inv_total = None
+            overhead = []
             if carrier == "UPS":
-                df_part, inv_total = parse_ups_invoice(uf)
+                df_part, inv_total, overhead = parse_ups_invoice(uf)
             elif carrier == "Bring":
-                df_part, inv_total = parse_bring_invoice(uf)
+                df_part, inv_total, overhead = parse_bring_invoice(uf)
             elif carrier == "DHL Freight":
-                df_part, inv_total = parse_dhl_freight_invoice(uf)
+                df_part, inv_total, overhead = parse_dhl_freight_invoice(uf)
             elif carrier in ("DHL Express", "DHL"):
-                df_part, inv_total = parse_dhl_express_invoice(uf)
+                df_part, inv_total, overhead = parse_dhl_express_invoice(uf)
             else:
                 df_part = pd.DataFrame()
 
@@ -748,6 +828,9 @@ def page_upload():
             if inv_total:
                 total_invoice += inv_total
                 has_any_total = True
+
+            # Collect overhead charges
+            all_overhead.extend(overhead)
 
             # Extract dates from invoice
             uf.seek(0)
@@ -789,7 +872,7 @@ def page_upload():
     inv_total = total_invoice if has_any_total else None
 
     st.markdown("---")
-    show_analysis(df, invoice_total=inv_total, n_files=len(all_dfs))
+    show_analysis(df, invoice_total=inv_total, n_files=len(all_dfs), overhead=all_overhead)
 
 
 def page_history():
