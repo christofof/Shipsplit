@@ -314,6 +314,80 @@ def parse_dhl_express_invoice(pdf_file):
     return pd.DataFrame(), None
 
 
+def extract_invoice_dates(pdf_file):
+    """Extract invoice date and order period from a PDF invoice."""
+    with pdfplumber.open(pdf_file) as pdf:
+        text = ""
+        for p in pdf.pages[:2]:
+            t = p.extract_text()
+            if t:
+                text += t + "\n"
+
+    dates = {"invoice_date": None, "period_start": None, "period_end": None}
+    date_re = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+    # Bring: "Orderperiod 2026-03-16 - 2026-03-22"
+    m = re.search(r"Orderperiod\s+(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})", text)
+    if m:
+        dates["period_start"] = m.group(1)
+        dates["period_end"] = m.group(2)
+
+    # Bring: "Fakturadatum 2026-03-23"
+    m = re.search(r"Fakturadatum\s+(\d{4}-\d{2}-\d{2})", text)
+    if m:
+        dates["invoice_date"] = m.group(1)
+
+    # UPS: "Fakturadatum\n17 mars 2026"
+    if not dates["invoice_date"]:
+        months_sv = {"januari": "01", "februari": "02", "mars": "03", "april": "04",
+                     "maj": "05", "juni": "06", "juli": "07", "augusti": "08",
+                     "september": "09", "oktober": "10", "november": "11", "december": "12"}
+        m = re.search(r"Fakturadatum\s*\n?\s*(\d{1,2})\s+(\w+)\s+(\d{4})", text)
+        if m:
+            day, month_name, year = m.group(1), m.group(2).lower(), m.group(3)
+            if month_name in months_sv:
+                dates["invoice_date"] = f"{year}-{months_sv[month_name]}-{int(day):02d}"
+
+    # DHL: "Fakturadatum 2026-03-14" or "Fakturadatum: 20260314"
+    if not dates["invoice_date"]:
+        m = re.search(r"Fakturadatum:?\s*(\d{4})(\d{2})(\d{2})", text)
+        if m:
+            dates["invoice_date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # If no period found, use invoice date as both
+    if not dates["period_start"] and dates["invoice_date"]:
+        dates["period_start"] = dates["invoice_date"]
+        dates["period_end"] = dates["invoice_date"]
+
+    return dates
+
+
+def check_password():
+    """Simple password gate. Returns True if authenticated."""
+    try:
+        correct_pw = st.secrets["auth"]["password"]
+    except (KeyError, FileNotFoundError):
+        return True  # No password configured, allow access
+
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    st.title("📦 Shipsplit")
+    pw = st.text_input("Lösenord", type="password")
+    if pw:
+        if pw == correct_pw:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Fel lösenord.")
+    else:
+        st.info("Ange lösenord för att fortsätta.")
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE LAYER (Supabase)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -329,15 +403,23 @@ def init_supabase():
         return None
 
 
-def save_invoice(sb, filename, carrier, invoice_total, parsed_total, df):
+def save_invoice(sb, filename, carrier, invoice_total, parsed_total, df, dates=None):
     """Save parsed invoice and shipment rows to Supabase."""
-    # Insert invoice record
-    inv = sb.table("invoices").insert({
+    record = {
         "filename": filename,
         "carrier": carrier,
         "invoice_total": float(invoice_total) if invoice_total else None,
         "parsed_total": float(parsed_total),
-    }).execute()
+    }
+    if dates:
+        if dates.get("invoice_date"):
+            record["invoice_date"] = dates["invoice_date"]
+        if dates.get("period_start"):
+            record["period_start"] = dates["period_start"]
+        if dates.get("period_end"):
+            record["period_end"] = dates["period_end"]
+
+    inv = sb.table("invoices").insert(record).execute()
 
     invoice_id = inv.data[0]["id"]
 
@@ -658,11 +740,15 @@ def page_upload():
                 total_invoice += inv_total
                 has_any_total = True
 
+            # Extract dates from invoice
+            uf.seek(0)
+            dates = extract_invoice_dates(uf)
+
             # Save to database
             if sb:
                 try:
                     save_invoice(sb, uf.name, carrier, inv_total,
-                                 df_part["Belopp (SEK)"].sum(), df_part)
+                                 df_part["Belopp (SEK)"].sum(), df_part, dates=dates)
                     saved_count += 1
                     msgs.append(
                         f"✅ **{uf.name}** — {carrier}, {len(df_part)} rader, "
@@ -710,62 +796,64 @@ def page_history():
         st.info("Inga fakturor uppladdade ännu. Gå till **Ladda upp** för att börja.")
         return
 
-    # Parse dates
+    # Parse dates — prefer period dates, fall back to upload_date
     invoices_df["upload_date"] = pd.to_datetime(invoices_df["upload_date"])
-    invoices_df["Datum"] = invoices_df["upload_date"].dt.strftime("%Y-%m-%d")
+    invoices_df["period_start"] = pd.to_datetime(invoices_df["period_start"], errors="coerce")
+    invoices_df["period_end"] = pd.to_datetime(invoices_df["period_end"], errors="coerce")
+
+    # Display date: use period if available, else upload date
+    invoices_df["display_date"] = invoices_df["period_start"].fillna(invoices_df["upload_date"])
+    invoices_df["Period"] = invoices_df.apply(
+        lambda r: (f"{r['period_start'].strftime('%Y-%m-%d')} — {r['period_end'].strftime('%Y-%m-%d')}"
+                   if pd.notna(r["period_start"]) and pd.notna(r["period_end"])
+                   else r["upload_date"].strftime("%Y-%m-%d")),
+        axis=1,
+    )
 
     # ── Filters ──────────────────────────────────────────────────────────
     st.subheader("Filter")
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    f1, f2 = st.columns(2)
 
-    with filter_col1:
+    with f1:
         carriers = sorted(invoices_df["carrier"].unique())
         sel_carriers = st.multiselect("Transportör", carriers, default=carriers)
 
-    with filter_col2:
-        min_date = invoices_df["upload_date"].min().date()
-        max_date = invoices_df["upload_date"].max().date()
-        date_range = st.date_input(
-            "Period",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date,
-        )
+    with f2:
+        all_dates = invoices_df["display_date"].dropna()
+        if not all_dates.empty:
+            min_d = all_dates.min().date()
+            max_d = all_dates.max().date()
+        else:
+            min_d = max_d = date.today()
+        date_range = st.date_input("Period (orderperiod / fakturadatum)",
+                                   value=(min_d, max_d), min_value=min_d, max_value=max_d)
 
-    with filter_col3:
-        st.metric("Fakturor i urval", "—")  # placeholder, updated below
-
-    # Apply filters
+    # Apply invoice-level filters
     filtered = invoices_df[invoices_df["carrier"].isin(sel_carriers)]
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start, end = date_range
         filtered = filtered[
-            (filtered["upload_date"].dt.date >= start) &
-            (filtered["upload_date"].dt.date <= end)
+            (filtered["display_date"].dt.date >= start) &
+            (filtered["display_date"].dt.date <= end)
         ]
 
     if filtered.empty:
         st.warning("Inga fakturor matchar filtret.")
         return
 
-    # Update count
-    filter_col3.metric("Fakturor i urval", len(filtered))
-
     # ── Invoice list ─────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("Uppladdade fakturor")
+    st.subheader(f"Uppladdade fakturor ({len(filtered)} st)")
 
-    display_inv = filtered[["Datum", "filename", "carrier", "invoice_total", "parsed_total"]].copy()
-    display_inv.columns = ["Datum", "Filnamn", "Transportör", "Fakturabelopp", "Parsad summa"]
+    display_inv = filtered[["Period", "filename", "carrier", "invoice_total", "parsed_total"]].copy()
+    display_inv.columns = ["Period", "Filnamn", "Transportör", "Fakturabelopp", "Parsad summa"]
     display_inv["Fakturabelopp"] = display_inv["Fakturabelopp"].apply(
-        lambda x: f"{x:,.0f}" if pd.notna(x) else "—"
-    )
+        lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
     display_inv["Parsad summa"] = display_inv["Parsad summa"].apply(
-        lambda x: f"{x:,.0f}" if pd.notna(x) else "—"
-    )
+        lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
     st.dataframe(display_inv, use_container_width=True, hide_index=True)
 
-    # ── Load shipments and show analysis ─────────────────────────────────
+    # ── Load shipments ───────────────────────────────────────────────────
     invoice_ids = filtered["id"].tolist()
     total_inv = filtered["invoice_total"].sum() if filtered["invoice_total"].notna().any() else None
 
@@ -776,13 +864,42 @@ def page_history():
         st.warning("Inga sändningar hittade för de valda fakturorna.")
         return
 
+    # ── Shipment-level filters ───────────────────────────────────────────
+    st.markdown("---")
+    sf1, sf2 = st.columns(2)
+
+    with sf1:
+        countries = sorted(df["Land"].unique())
+        sel_countries = st.multiselect("Land", countries, default=countries,
+                                       help="Filtrera analysen på specifika länder")
+
+    with sf2:
+        types = sorted(df["Typ"].dropna().unique()) if "Typ" in df.columns else []
+        if types:
+            sel_types = st.multiselect("Typ", types, default=types,
+                                       help="Utgående, Retur, Övrigt")
+
+    # Apply shipment-level filters
+    df = df[df["Land"].isin(sel_countries)]
+    if types and sel_types:
+        df = df[df["Typ"].isin(sel_types)]
+
+    if df.empty:
+        st.warning("Inga sändningar matchar filtret.")
+        return
+
+    # Recalculate invoice total for filtered view
+    if sel_countries != countries or (types and sel_types != types):
+        # Filters changed — invoice total no longer meaningful
+        total_inv = None
+
     st.markdown("---")
     show_analysis(df, invoice_total=total_inv, n_files=len(filtered))
 
     # ── Delete invoice ───────────────────────────────────────────────────
     st.markdown("---")
     with st.expander("🗑️ Ta bort faktura"):
-        del_options = {f"{r['Datum']} — {r['filename']} ({r['carrier']})": r["id"]
+        del_options = {f"{r['Period']} — {r['filename']} ({r['carrier']})": r["id"]
                        for _, r in filtered.iterrows()}
         sel_del = st.selectbox("Välj faktura att ta bort", list(del_options.keys()))
         if st.button("Ta bort", type="secondary"):
@@ -794,6 +911,9 @@ def page_history():
 # ═══════════════════════════════════════════════════════════════════════════════
 # NAVIGATION
 # ═══════════════════════════════════════════════════════════════════════════════
+
+if not check_password():
+    st.stop()
 
 page = st.sidebar.radio(
     "Navigation",
