@@ -9,6 +9,7 @@ import pdfplumber
 import pandas as pd
 import plotly.express as px
 import re
+import json
 from datetime import datetime, date, timedelta
 
 # ─── Page config ────────────────────────────────────────────────────────────
@@ -454,7 +455,7 @@ def init_supabase():
         return None
 
 
-def save_invoice(sb, filename, carrier, invoice_total, parsed_total, df, dates=None):
+def save_invoice(sb, filename, carrier, invoice_total, parsed_total, df, dates=None, overhead=None):
     """Save parsed invoice and shipment rows to Supabase."""
     record = {
         "filename": filename,
@@ -469,6 +470,8 @@ def save_invoice(sb, filename, carrier, invoice_total, parsed_total, df, dates=N
             record["period_start"] = dates["period_start"]
         if dates.get("period_end"):
             record["period_end"] = dates["period_end"]
+    if overhead:
+        record["overhead"] = json.dumps(overhead)
 
     inv = sb.table("invoices").insert(record).execute()
 
@@ -840,7 +843,8 @@ def page_upload():
             if sb:
                 try:
                     save_invoice(sb, uf.name, carrier, inv_total,
-                                 df_part["Belopp (SEK)"].sum(), df_part, dates=dates)
+                                 df_part["Belopp (SEK)"].sum(), df_part, dates=dates,
+                                 overhead=overhead)
                     saved_count += 1
                     msgs.append(
                         f"✅ **{uf.name}** — {carrier}, {len(df_part)} rader, "
@@ -985,12 +989,24 @@ def page_history():
         return
 
     # Recalculate invoice total for filtered view
-    if sel_countries != countries or (types and sel_types != types):
-        # Filters changed — invoice total no longer meaningful
+    filters_active = sel_countries != countries or (types and sel_types != types)
+    if filters_active:
         total_inv = None
 
     st.markdown("---")
-    show_analysis(df, invoice_total=total_inv, n_files=len(filtered))
+
+    # Load overhead from stored invoices (skip if shipment filters active)
+    all_overhead = []
+    if not filters_active:
+        for _, inv_row in filtered.iterrows():
+            oh_json = inv_row.get("overhead")
+            if oh_json and isinstance(oh_json, str):
+                try:
+                    all_overhead.extend(json.loads(oh_json))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+    show_analysis(df, invoice_total=total_inv, n_files=len(filtered), overhead=all_overhead if all_overhead else None)
 
     # ── Delete invoice ───────────────────────────────────────────────────
     st.markdown("---")
