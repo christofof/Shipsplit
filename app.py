@@ -225,6 +225,12 @@ def parse_bring_invoice(pdf_file):
             qty = int(m.group(5))
             amount = float(m.group(7).replace(" ", "").replace(",", "."))
             is_return = "Return" in service
+
+            # Surcharge lines (Fuel fee, Veiavgift, Label Free, etc.) have a comma
+            # in the service name. These apply to already-counted parcels, so kolli=0.
+            is_surcharge = "," in service
+            kolli = 0 if is_surcharge else qty
+
             if from_c == to_c:
                 customer = from_c
             elif is_return:
@@ -233,7 +239,7 @@ def parse_bring_invoice(pdf_file):
                 customer = to_c if to_c != "SE" else from_c
             records.append({
                 "Land": normalize_country(customer), "Belopp (SEK)": amount,
-                "Kolli": qty, "Typ": "Retur" if is_return else "Utgående",
+                "Kolli": kolli, "Typ": "Retur" if is_return else "Utgående",
                 "Detalj": service,
             })
 
@@ -832,7 +838,8 @@ def page_history():
                                    value=(min_d, max_d), min_value=min_d, max_value=max_d)
 
     # Apply invoice-level filters
-    filtered = invoices_df[invoices_df["carrier"].isin(sel_carriers)]
+    filtered = invoices_df[invoices_df["carrier"].isin(sel_carriers)].copy()
+    filtered["display_date"] = pd.to_datetime(filtered["display_date"], errors="coerce")
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start, end = date_range
         filtered = filtered[
