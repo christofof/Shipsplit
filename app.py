@@ -224,12 +224,14 @@ def parse_bring_invoice(pdf_file):
             from_c, to_c = m.group(3), m.group(4)
             qty = int(m.group(5))
             amount = float(m.group(7).replace(" ", "").replace(",", "."))
-            is_return = "Return" in service
 
             # Surcharge lines (Fuel fee, Veiavgift, Label Free, etc.) have a comma
             # in the service name. These apply to already-counted parcels, so kolli=0.
             is_surcharge = "," in service
             kolli = 0 if is_surcharge else qty
+
+            # "Attempted Delivery Return" is a failed outbound delivery, not a customer return
+            is_return = "Return" in service and "Attempted Delivery" not in service
 
             if from_c == to_c:
                 customer = from_c
@@ -538,16 +540,17 @@ def show_analysis(df, invoice_total=None, n_files=1):
         pivot_kolli["Totalt kolli"] = pivot_kolli.sum(axis=1)
 
         country_table = pivot_amount.sort_values("Totalt", ascending=False).reset_index()
-        kolli_sorted = pivot_kolli.sort_values("Totalt kolli", ascending=False)
-        country_table["Kolli"] = kolli_sorted["Totalt kolli"].values
+        # Align kolli by Land (not by independent sort!)
+        kolli_by_land = pivot_kolli.reindex(pivot_amount.sort_values("Totalt", ascending=False).index)
+        country_table["Kolli"] = kolli_by_land["Totalt kolli"].values
 
         for typ in type_order:
-            kc = kolli_sorted[typ].values
+            kc = kolli_by_land[typ].values
             ac = country_table[typ].values
             country_table[f"Snitt {typ.lower()}"] = [
                 round(a / k, 1) if k > 0 else 0.0 for a, k in zip(ac, kc)
             ]
-        tk = kolli_sorted["Totalt kolli"].values
+        tk = kolli_by_land["Totalt kolli"].values
         country_table["Snitt totalt"] = [
             round(a / k, 1) if k > 0 else 0.0
             for a, k in zip(country_table["Totalt"].values, tk)
