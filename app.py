@@ -982,9 +982,12 @@ def page_history():
     filtered["display_date"] = pd.to_datetime(filtered["display_date"], errors="coerce")
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start, end = date_range
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
         filtered = filtered[
-            (filtered["display_date"].dt.date >= start) &
-            (filtered["display_date"].dt.date <= end)
+            filtered["display_date"].notna() &
+            (filtered["display_date"] >= start_ts) &
+            (filtered["display_date"] <= end_ts)
         ]
 
     if filtered.empty:
