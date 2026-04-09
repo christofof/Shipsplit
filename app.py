@@ -508,14 +508,21 @@ def load_invoices(sb):
 
 def load_shipments(sb, invoice_ids=None):
     """Load shipments, optionally filtered by invoice IDs."""
-    query = sb.table("shipments").select("*")
+    all_rows = []
     if invoice_ids:
-        query = query.in_("invoice_id", invoice_ids)
-    result = query.execute()
-    if not result.data:
+        # Fetch in chunks to handle Supabase's default 1000-row limit
+        for inv_id in invoice_ids:
+            result = sb.table("shipments").select("*").eq("invoice_id", inv_id).limit(5000).execute()
+            if result.data:
+                all_rows.extend(result.data)
+    else:
+        result = sb.table("shipments").select("*").limit(10000).execute()
+        if result.data:
+            all_rows = result.data
+
+    if not all_rows:
         return pd.DataFrame()
-    df = pd.DataFrame(result.data)
-    # Rename columns to match display format
+    df = pd.DataFrame(all_rows)
     df = df.rename(columns={"land": "Land", "belopp": "Belopp (SEK)",
                             "kolli": "Kolli", "typ": "Typ", "detalj": "Detalj"})
     return df
