@@ -916,27 +916,38 @@ def page_history():
         st.info("Inga fakturor uppladdade ännu. Gå till **Ladda upp** för att börja.")
         return
 
-    # Parse dates — prefer period dates, fall back to upload_date
-    invoices_df["upload_date"] = pd.to_datetime(invoices_df["upload_date"])
-    invoices_df["period_start"] = pd.to_datetime(invoices_df["period_start"], errors="coerce")
-    invoices_df["period_end"] = pd.to_datetime(invoices_df["period_end"], errors="coerce")
+    # Parse dates safely as strings for display, timestamps for sorting
+    invoices_df["upload_date"] = pd.to_datetime(invoices_df["upload_date"], errors="coerce")
 
-    # Display date: use period if available, else upload date
-    invoices_df["display_date"] = pd.to_datetime(
-        invoices_df["period_start"].fillna(invoices_df["upload_date"]),
-        errors="coerce",
-    )
-    invoices_df["Period"] = invoices_df.apply(
-        lambda r: (f"{r['period_start'].strftime('%Y-%m-%d')} — {r['period_end'].strftime('%Y-%m-%d')}"
-                   if pd.notna(r["period_start"]) and pd.notna(r["period_end"])
-                   else r["upload_date"].strftime("%Y-%m-%d")),
-        axis=1,
-    )
+    def safe_date_str(row):
+        """Build a display string for the period."""
+        ps = row.get("period_start")
+        pe = row.get("period_end")
+        if ps and pe and str(ps) != "None" and str(pe) != "None":
+            return f"{str(ps)[:10]} — {str(pe)[:10]}"
+        ud = row.get("upload_date")
+        if pd.notna(ud):
+            return str(ud)[:10]
+        return "Okänt datum"
 
-    # ── Filters ──────────────────────────────────────────────────────────
+    invoices_df["Period"] = invoices_df.apply(safe_date_str, axis=1)
+
+    # Sort date for filtering (use period_start string → date, fallback to upload_date)
+    def safe_sort_date(row):
+        ps = row.get("period_start")
+        if ps and str(ps) not in ("None", "NaT", ""):
+            try:
+                return pd.Timestamp(str(ps)[:10])
+            except Exception:
+                pass
+        return row.get("upload_date", pd.NaT)
+
+    invoices_df["sort_date"] = invoices_df.apply(safe_sort_date, axis=1)
+    invoices_df["sort_date"] = pd.to_datetime(invoices_df["sort_date"], errors="coerce")
+
+    # ── Quick filters ────────────────────────────────────────────────────
     st.subheader("Filter")
 
-    # Quick period buttons
     today = date.today()
     period_options = {
         "Alla": None,
@@ -953,63 +964,45 @@ def page_history():
     sel_period = st.radio("Snabbval period", list(period_options.keys()),
                           horizontal=True, index=0)
 
-    f1, f2 = st.columns(2)
+    carriers = sorted(invoices_df["carrier"].unique())
+    sel_carriers = st.multiselect("Transportör", carriers, default=carriers)
 
-    with f1:
-        carriers = sorted(invoices_df["carrier"].unique())
-        sel_carriers = st.multiselect("Transportör", carriers, default=carriers)
-
-    with f2:
-        all_dates = invoices_df["display_date"].dropna()
-        min_d = all_dates.min().date() if not all_dates.empty else today
-        max_d = all_dates.max().date() if not all_dates.empty else today
-
-        # Set date range from quick-select or manual
-        if period_options[sel_period] is not None:
-            default_start, default_end = period_options[sel_period]
-            # Clamp to available data
-            default_start = max(default_start, min_d)
-            default_end = min(default_end, max_d)
-        else:
-            default_start, default_end = min_d, max_d
-
-        date_range = st.date_input("Period (manuellt urval)",
-                                   value=(default_start, default_end),
-                                   min_value=min_d, max_value=max_d)
-
-    # Apply carrier + date filters
+    # Apply carrier filter
     filtered = invoices_df[invoices_df["carrier"].isin(sel_carriers)].copy()
-    filtered["display_date"] = pd.to_datetime(filtered["display_date"], errors="coerce")
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start, end = date_range
-        start_ts = pd.Timestamp(start)
-        end_ts = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-        filtered = filtered[
-            filtered["display_date"].notna() &
-            (filtered["display_date"] >= start_ts) &
-            (filtered["display_date"] <= end_ts)
-        ]
+
+    # Apply period filter
+    if period_options[sel_period] is not None:
+        p_start, p_end = period_options[sel_period]
+        p_start_ts = pd.Timestamp(p_start)
+        p_end_ts = pd.Timestamp(p_end) + pd.Timedelta(days=1, seconds=-1)
+        mask = filtered["sort_date"].notna() & (filtered["sort_date"] >= p_start_ts) & (filtered["sort_date"] <= p_end_ts)
+        filtered = filtered[mask]
+
+    # ── Invoice picker (primary selection) ────────────────────────────────
+    st.markdown("---")
+    st.subheader("Välj fakturor att analysera")
 
     if filtered.empty:
         st.warning("Inga fakturor matchar filtret.")
         return
 
-    # Invoice picker — let user select/deselect specific invoices
-    inv_labels = {
-        f"{r['Period']}  |  {r['filename']}  |  {r['carrier']}": r["id"]
-        for _, r in filtered.iterrows()
-    }
-    with st.expander(f"Välj fakturor ({len(filtered)} matchar filtret)", expanded=False):
-        sel_inv_labels = st.multiselect(
-            "Inkludera fakturor",
-            list(inv_labels.keys()),
-            default=list(inv_labels.keys()),
-            label_visibility="collapsed",
-        )
+    # Build label for each invoice
+    def inv_label(row):
+        amt = f"{row['parsed_total']:,.0f} SEK" if pd.notna(row.get("parsed_total")) else "—"
+        return f"{row['Period']}  ·  {row['carrier']}  ·  {row['filename']}  ·  {amt}"
 
-    # Apply invoice selection
-    sel_inv_ids = [inv_labels[lbl] for lbl in sel_inv_labels]
-    filtered = filtered[filtered["id"].isin(sel_inv_ids)]
+    filtered["label"] = filtered.apply(inv_label, axis=1)
+    label_to_id = dict(zip(filtered["label"], filtered["id"]))
+
+    sel_labels = st.multiselect(
+        "Fakturor i databasen",
+        list(label_to_id.keys()),
+        default=list(label_to_id.keys()),
+        help="Avmarkera fakturor du vill exkludera från analysen.",
+    )
+
+    sel_ids = [label_to_id[lbl] for lbl in sel_labels]
+    filtered = filtered[filtered["id"].isin(sel_ids)]
 
     if filtered.empty:
         st.warning("Inga fakturor valda.")
