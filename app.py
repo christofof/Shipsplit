@@ -507,18 +507,33 @@ def load_invoices(sb):
 
 
 def load_shipments(sb, invoice_ids=None):
-    """Load shipments, optionally filtered by invoice IDs."""
+    """Load shipments, optionally filtered by invoice IDs.
+    Paginates to overcome Supabase's 1000-row default limit."""
     all_rows = []
-    if invoice_ids:
-        # Fetch in chunks to handle Supabase's default 1000-row limit
-        for inv_id in invoice_ids:
-            result = sb.table("shipments").select("*").eq("invoice_id", inv_id).limit(5000).execute()
+
+    def paginated_fetch(query):
+        """Fetch all rows using range-based pagination."""
+        rows = []
+        page_size = 1000
+        offset = 0
+        while True:
+            result = query.range(offset, offset + page_size - 1).execute()
             if result.data:
-                all_rows.extend(result.data)
+                rows.extend(result.data)
+                if len(result.data) < page_size:
+                    break  # Last page
+                offset += page_size
+            else:
+                break
+        return rows
+
+    if invoice_ids:
+        for inv_id in invoice_ids:
+            query = sb.table("shipments").select("*").eq("invoice_id", inv_id)
+            all_rows.extend(paginated_fetch(query))
     else:
-        result = sb.table("shipments").select("*").limit(10000).execute()
-        if result.data:
-            all_rows = result.data
+        query = sb.table("shipments").select("*")
+        all_rows = paginated_fetch(query)
 
     if not all_rows:
         return pd.DataFrame()
