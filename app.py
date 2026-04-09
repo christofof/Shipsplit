@@ -935,6 +935,24 @@ def page_history():
 
     # ── Filters ──────────────────────────────────────────────────────────
     st.subheader("Filter")
+
+    # Quick period buttons
+    today = date.today()
+    period_options = {
+        "Alla": None,
+        "Denna månad": (today.replace(day=1), today),
+        "Förra månaden": (
+            (today.replace(day=1) - timedelta(days=1)).replace(day=1),
+            today.replace(day=1) - timedelta(days=1),
+        ),
+        "Senaste 3 mån": (today - timedelta(days=90), today),
+        "Senaste 6 mån": (today - timedelta(days=180), today),
+        "Senaste 12 mån": (today - timedelta(days=365), today),
+    }
+
+    sel_period = st.radio("Snabbval period", list(period_options.keys()),
+                          horizontal=True, index=0)
+
     f1, f2 = st.columns(2)
 
     with f1:
@@ -943,15 +961,23 @@ def page_history():
 
     with f2:
         all_dates = invoices_df["display_date"].dropna()
-        if not all_dates.empty:
-            min_d = all_dates.min().date()
-            max_d = all_dates.max().date()
-        else:
-            min_d = max_d = date.today()
-        date_range = st.date_input("Period (orderperiod / fakturadatum)",
-                                   value=(min_d, max_d), min_value=min_d, max_value=max_d)
+        min_d = all_dates.min().date() if not all_dates.empty else today
+        max_d = all_dates.max().date() if not all_dates.empty else today
 
-    # Apply invoice-level filters
+        # Set date range from quick-select or manual
+        if period_options[sel_period] is not None:
+            default_start, default_end = period_options[sel_period]
+            # Clamp to available data
+            default_start = max(default_start, min_d)
+            default_end = min(default_end, max_d)
+        else:
+            default_start, default_end = min_d, max_d
+
+        date_range = st.date_input("Period (manuellt urval)",
+                                   value=(default_start, default_end),
+                                   min_value=min_d, max_value=max_d)
+
+    # Apply carrier + date filters
     filtered = invoices_df[invoices_df["carrier"].isin(sel_carriers)].copy()
     filtered["display_date"] = pd.to_datetime(filtered["display_date"], errors="coerce")
     if isinstance(date_range, tuple) and len(date_range) == 2:
@@ -963,6 +989,27 @@ def page_history():
 
     if filtered.empty:
         st.warning("Inga fakturor matchar filtret.")
+        return
+
+    # Invoice picker — let user select/deselect specific invoices
+    inv_labels = {
+        f"{r['Period']}  |  {r['filename']}  |  {r['carrier']}": r["id"]
+        for _, r in filtered.iterrows()
+    }
+    with st.expander(f"Välj fakturor ({len(filtered)} matchar filtret)", expanded=False):
+        sel_inv_labels = st.multiselect(
+            "Inkludera fakturor",
+            list(inv_labels.keys()),
+            default=list(inv_labels.keys()),
+            label_visibility="collapsed",
+        )
+
+    # Apply invoice selection
+    sel_inv_ids = [inv_labels[lbl] for lbl in sel_inv_labels]
+    filtered = filtered[filtered["id"].isin(sel_inv_ids)]
+
+    if filtered.empty:
+        st.warning("Inga fakturor valda.")
         return
 
     # ── Invoice list ─────────────────────────────────────────────────────
