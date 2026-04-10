@@ -350,12 +350,17 @@ def parse_dhl_freight_invoice(pdf_file):
                 full_text += t + "\n"
 
     # ── Map of all known DHL Freight service types ──
+    # NOTE: order matters — longer keys must come before shorter substrings
+    # (HOME DEL RETURN before HOME DELIVERY) since substring matching is used
+    # on uppercased lines in the spec_records pass.
     DHL_SERVICE_MAP = {
         "SERVPOINT B2C": ("Servpoint B2C", "Utgående"),
         "SERVPOINT C2B": ("Servpoint C2B", "Retur"),
+        "HOME DEL RETURN": ("Home Del Return", "Retur"),
         "HOME DELIVERY": ("Home Delivery", "Utgående"),
         "HEMLEVERANS PAKET": ("Hemleverans Paket", "Utgående"),
         "DHL PAKET": ("Dhl Paket", "Utgående"),
+        "DHL PALL": ("Dhl Pall", "Utgående"),
     }
 
     lines = full_text.split("\n")
@@ -412,13 +417,22 @@ def parse_dhl_freight_invoice(pdf_file):
     records = spec_records if spec_total >= summary_total else summary_records
 
     invoice_total = None
+    # DHL layouts:
+    # (a) "Summa exkl. moms   123 456,78"  — rare, older layout
+    # (b) "Momspliktigt belopp SEK 73713,10" — inline, newer layout
+    # (c) "TOTAL 132477,77" — always present, both layouts
     m = re.search(r"Summa exkl\.?\s*moms\s+([\d\s.,]+)", full_text)
     if m:
         invoice_total = parse_swedish_number(m.group(1))
-    else:
-        m2 = re.search(r"Momspliktigt belopp\s+SEK\s+([\d\s.,]+)", full_text)
+    if invoice_total is None:
+        m2 = re.search(r"Momspliktigt belopp\s+SEK\s+([\d\s.,]+?)(?:\s|$)", full_text)
         if m2:
             invoice_total = parse_swedish_number(m2.group(1))
+    if invoice_total is None:
+        # Last-resort: the "TOTAL <amount>" summary row
+        m3 = re.search(r"(?:^|\n)\s*TOTAL\s+([\d\s.,]+)", full_text)
+        if m3:
+            invoice_total = parse_swedish_number(m3.group(1))
 
     return pd.DataFrame(records), invoice_total, []
 
@@ -427,8 +441,15 @@ def parse_dhl_express_invoice(pdf_file):
     return pd.DataFrame(), None, []
 
 
-def extract_invoice_dates(pdf_file):
-    """Extract invoice date and order period from a PDF invoice."""
+def extract_invoice_dates(pdf_file, filename: str | None = None):
+    """Extract invoice date and order period from a PDF invoice.
+
+    Args:
+        pdf_file: BytesIO / path / UploadedFile
+        filename: Optional original filename. Used as a reliable fallback for
+            DHL invoices which embed the invoice date as YYYYMMDD in the
+            filename (e.g. D21425827_20260314___.pdf).
+    """
     with pdfplumber.open(pdf_file) as pdf:
         text = ""
         for p in pdf.pages[:2]:
@@ -437,9 +458,12 @@ def extract_invoice_dates(pdf_file):
                 text += t + "\n"
 
     dates = {"invoice_date": None, "period_start": None, "period_end": None}
-    date_re = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 
-    # Bring: "Orderperiod 2026-03-16 - 2026-03-22"
+    # Resolve filename if not passed explicitly
+    if not filename:
+        filename = getattr(pdf_file, "name", None) or ""
+
+    # ── Bring: "Orderperiod 2026-03-16 - 2026-03-22" ──────────────────
     m = re.search(r"Orderperiod\s+(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})", text)
     if m:
         dates["period_start"] = m.group(1)
@@ -450,13 +474,11 @@ def extract_invoice_dates(pdf_file):
     if m:
         dates["invoice_date"] = m.group(1)
 
-    # UPS: "Fakturadatum\n17 mars 2026"
+    # ── UPS: "Fakturadatum\n17 mars 2026" (XML-tagged layouts supported) ──
     if not dates["invoice_date"]:
         months_sv = {"januari": "01", "februari": "02", "mars": "03", "april": "04",
                      "maj": "05", "juni": "06", "juli": "07", "augusti": "08",
                      "september": "09", "oktober": "10", "november": "11", "december": "12"}
-        # Allow arbitrary content (e.g. <I>...</I> XML tags) between "Fakturadatum"
-        # and the actual date on PDFs with interleaved metadata.
         month_alt = "|".join(months_sv.keys())
         m = re.search(
             rf"Fakturadatum[\s\S]{{0,200}}?(\d{{1,2}})\s+({month_alt})\s+(\d{{4}})",
@@ -468,11 +490,87 @@ def extract_invoice_dates(pdf_file):
             if month_name in months_sv:
                 dates["invoice_date"] = f"{year}-{months_sv[month_name]}-{int(day):02d}"
 
-    # DHL: "Fakturadatum 2026-03-14" or "Fakturadatum: 20260314"
+    # ── DHL: "Fakturadatum 2025.12.31" (inline, dot or dash separator) ──
     if not dates["invoice_date"]:
-        m = re.search(r"Fakturadatum:?\s*(\d{4})(\d{2})(\d{2})", text)
+        m = re.search(r"Fakturadatum:?\s*(\d{4})[.\-](\d{2})[.\-](\d{2})", text)
         if m:
             dates["invoice_date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # ── DHL: "Fakturadatum: 20260314" (no separator) ──
+    if not dates["invoice_date"]:
+        m = re.search(r"Fakturadatum:?\s*(\d{4})(\d{2})(\d{2})(?!\d)", text)
+        if m:
+            dates["invoice_date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # ── DHL column-layout fallback: metadata line contains fakturadatum ──
+    # Example: "21326117 groupinvoices@babyshop.se 168960 2026.01.30 BABYSHOP"
+    if not dates["invoice_date"]:
+        m = re.search(
+            r"\d{6,}\s+[\w.@-]+@[\w.-]+\s+\d+\s+(\d{4})[.\-](\d{2})[.\-](\d{2})\s+BABYSHOP",
+            text,
+        )
+        if m:
+            dates["invoice_date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # ── DHL filename fallback: D<inv>_YYYYMMDD[___].pdf ──
+    if not dates["invoice_date"] and filename:
+        m = re.search(r"_(\d{4})(\d{2})(\d{2})(?:_|\.|$)", filename)
+        if m:
+            y, mo, d = m.group(1), m.group(2), m.group(3)
+            try:
+                # Sanity check — valid calendar date
+                if 1 <= int(mo) <= 12 and 1 <= int(d) <= 31:
+                    dates["invoice_date"] = f"{y}-{mo}-{d}"
+            except ValueError:
+                pass
+
+    # ── DHL period: "Avser perioden 2025.12.22 - 2025.12.31" (full format) ──
+    if not dates["period_start"]:
+        m = re.search(
+            r"Avser perioden[\s\S]{0,50}?(\d{4})[.\-](\d{2})[.\-](\d{2})\s*-\s*(\d{4})[.\-](\d{2})[.\-](\d{2})",
+            text,
+        )
+        if m:
+            dates["period_start"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            dates["period_end"] = f"{m.group(4)}-{m.group(5)}-{m.group(6)}"
+
+    # ── DHL period: "Avser perioden 1222 - 1231" (MMDD - MMDD, year implicit) ──
+    if not dates["period_start"] and dates["invoice_date"]:
+        m = re.search(
+            r"Avser perioden[\s\S]{0,50}?(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})",
+            text,
+        )
+        if m:
+            inv_year = int(dates["invoice_date"][:4])
+            inv_month = int(dates["invoice_date"][5:7])
+            start_mo = int(m.group(1))
+            start_d = int(m.group(2))
+            end_mo = int(m.group(3))
+            end_d = int(m.group(4))
+            # Handle year boundary: if period month > invoice month, period is previous year
+            start_year = inv_year - 1 if start_mo > inv_month + 1 else inv_year
+            end_year = inv_year - 1 if end_mo > inv_month + 1 else inv_year
+            try:
+                dates["period_start"] = f"{start_year}-{start_mo:02d}-{start_d:02d}"
+                dates["period_end"] = f"{end_year}-{end_mo:02d}-{end_d:02d}"
+            except Exception:
+                pass
+
+    # ── DHL column-layout period: standalone "0124 - 0130" line ──
+    if not dates["period_start"] and dates["invoice_date"]:
+        m = re.search(r"(?:^|\n)\s*(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})\s*(?:\n|$)", text)
+        if m:
+            inv_year = int(dates["invoice_date"][:4])
+            inv_month = int(dates["invoice_date"][5:7])
+            start_mo = int(m.group(1))
+            start_d = int(m.group(2))
+            end_mo = int(m.group(3))
+            end_d = int(m.group(4))
+            if 1 <= start_mo <= 12 and 1 <= end_mo <= 12 and 1 <= start_d <= 31 and 1 <= end_d <= 31:
+                start_year = inv_year - 1 if start_mo > inv_month + 1 else inv_year
+                end_year = inv_year - 1 if end_mo > inv_month + 1 else inv_year
+                dates["period_start"] = f"{start_year}-{start_mo:02d}-{start_d:02d}"
+                dates["period_end"] = f"{end_year}-{end_mo:02d}-{end_d:02d}"
 
     # If no period found, use invoice date as both
     if not dates["period_start"] and dates["invoice_date"]:
@@ -1228,9 +1326,9 @@ def page_upload():
         # Collect overhead charges
         all_overhead.extend(overhead)
 
-        # Extract dates from invoice
+        # Extract dates from invoice (filename is a reliable fallback for DHL)
         uf.seek(0)
-        dates = extract_invoice_dates(uf)
+        dates = extract_invoice_dates(uf, filename=uf.name)
 
         # Save to database
         if sb:
