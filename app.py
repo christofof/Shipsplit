@@ -630,47 +630,78 @@ def show_trends(df, invoices_df):
     invoices_df: filtered invoices with period dates
     """
 
-    # ── Build a period lookup: invoice_id → period label + sort key ──────
+    # ── Granularity selector ────────────────────────────────────────────
+    granularity = st.radio(
+        "Gruppera per",
+        ["Vecka", "Månad", "Kvartal", "Per faktura"],
+        index=1,  # Månad default — best for board/trend analysis
+        horizontal=True,
+        key="trend_granularity",
+    )
+
+    # ── Build invoice_id → best-available date + carrier ────────────────
+    NULL_STRS = ("None", "NaT", "nan", "NaN", "")
     inv_lookup = {}
     for _, row in invoices_df.iterrows():
         inv_id = row["id"]
         ps = row.get("period_start")
-        pe = row.get("period_end")
         inv_date = row.get("invoice_date")
         carrier = row.get("carrier", "")
 
-        NULL_STRS = ("None", "NaT", "nan", "NaN", "")
-
-        # Best available date for this invoice
+        raw_date = None
         if ps and str(ps) not in NULL_STRS:
-            sort_key = str(ps)[:10]
+            raw_date = str(ps)[:10]
         elif inv_date and str(inv_date) not in NULL_STRS:
-            sort_key = str(inv_date)[:10]
-        else:
-            sort_key = "9999-99-99"
+            raw_date = str(inv_date)[:10]
 
-        # Period label
-        if ps and pe and str(ps) not in NULL_STRS and str(pe) not in NULL_STRS:
-            label = f"{str(ps)[:10]} — {str(pe)[:10]}"
-        elif inv_date and str(inv_date) not in NULL_STRS:
-            label = str(inv_date)[:10]
-        else:
-            label = "Okänt datum"
+        inv_lookup[inv_id] = {"raw_date": raw_date, "carrier": carrier}
 
-        inv_lookup[inv_id] = {"sort_key": sort_key, "label": label, "carrier": carrier}
-
-    # Attach period info to shipments
+    # Attach raw date + carrier to shipments
     df = df.copy()
-    df["period_sort"] = df["invoice_id"].map(lambda x: inv_lookup.get(x, {}).get("sort_key", "9999"))
-    df["Period"] = df["invoice_id"].map(lambda x: inv_lookup.get(x, {}).get("label", "Okänt"))
+    df["raw_date"] = df["invoice_id"].map(lambda x: inv_lookup.get(x, {}).get("raw_date"))
     df["Transportör"] = df["invoice_id"].map(lambda x: inv_lookup.get(x, {}).get("carrier", ""))
 
+    # Drop shipments with no resolvable date for trend analysis
+    df_dated = df[df["raw_date"].notna()].copy()
+    if df_dated.empty:
+        st.info("Inga fakturor med giltiga datum. Kontrollera datumparsningen.")
+        return
+    df_dated["date_ts"] = pd.to_datetime(df_dated["raw_date"], errors="coerce")
+    df_dated = df_dated[df_dated["date_ts"].notna()]
+
+    # Build period label + sort key based on chosen granularity
+    def bucket(ts: pd.Timestamp) -> tuple[str, str]:
+        if granularity == "Vecka":
+            iso = ts.isocalendar()
+            # Monday of that ISO week
+            monday = ts - pd.Timedelta(days=ts.weekday())
+            label = f"v.{iso.week:02d} {iso.year}"
+            return (monday.strftime("%Y-%m-%d"), label)
+        if granularity == "Månad":
+            return (ts.strftime("%Y-%m-01"), ts.strftime("%Y-%m"))
+        if granularity == "Kvartal":
+            q = (ts.month - 1) // 3 + 1
+            sort_key = f"{ts.year}-Q{q}"
+            return (sort_key, f"{ts.year} Q{q}")
+        # Per faktura
+        lbl = ts.strftime("%Y-%m-%d")
+        return (lbl, lbl)
+
+    buckets = df_dated["date_ts"].apply(bucket)
+    df_dated["period_sort"] = buckets.apply(lambda x: x[0])
+    df_dated["Period"] = buckets.apply(lambda x: x[1])
+
     # Sort periods chronologically
-    period_order = sorted(df[["period_sort", "Period"]].drop_duplicates().values.tolist())
-    period_labels = [p[1] for p in period_order]
+    period_order = (
+        df_dated[["period_sort", "Period"]]
+        .drop_duplicates()
+        .sort_values("period_sort")
+    )
+    period_labels = period_order["Period"].tolist()
+    df = df_dated  # rest of function uses df
 
     if len(period_labels) < 2:
-        st.info("Trendvyn kräver data från minst två perioder. Ladda upp fler fakturor.")
+        st.info("Trendvyn kräver data från minst två perioder. Välj en finare granularitet eller ladda upp fler fakturor.")
         return
 
     # ── Aggregate by period ──────────────────────────────────────────────
@@ -700,9 +731,8 @@ def show_trends(df, invoices_df):
 
         kc1, kc2, kc3 = st.columns(3)
         curr_label = str(curr["Period"])
-        curr_short = curr_label[:10] if curr_label not in ("Okänt datum",) else curr_label
         kc1.metric(
-            f"Totalkostnad ({curr_short})",
+            f"Totalkostnad ({curr_label})",
             f"{curr['Total']:,.0f} SEK",
             delta_str(curr["Total"], prev["Total"]),
             delta_color="inverse",
@@ -737,12 +767,12 @@ def show_trends(df, invoices_df):
     )
     fig_cost.update_traces(texttemplate="%{text:,.0f}", textposition="inside", textfont_size=10)
     fig_cost.update_layout(
-        title="Total fraktkostnad per period",
         xaxis_title="", yaxis_title="SEK", height=400,
-        margin=dict(l=10, r=20, t=40, b=20),
+        margin=dict(l=10, r=20, t=30, b=20),
         font=dict(family="DM Sans, sans-serif"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+    st.markdown("#### Total fraktkostnad per period")
     st.plotly_chart(fig_cost, use_container_width=True)
 
     # ── Chart 2: Cost per kolli over time, by carrier ────────────────────
@@ -762,12 +792,12 @@ def show_trends(df, invoices_df):
         markers=True,
     )
     fig_avg.update_layout(
-        title="Kostnad per kolli — trend per transportör",
         xaxis_title="", yaxis_title="SEK / kolli", height=350,
-        margin=dict(l=10, r=20, t=40, b=20),
+        margin=dict(l=10, r=20, t=30, b=20),
         font=dict(family="DM Sans, sans-serif"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+    st.markdown("#### Kostnad per kolli — trend per transportör")
     st.plotly_chart(fig_avg, use_container_width=True)
 
     # ── Chart 3: Outbound vs Return over time ────────────────────────────
@@ -786,12 +816,12 @@ def show_trends(df, invoices_df):
     )
     fig_type.update_traces(texttemplate="%{text:,.0f}", textposition="inside", textfont_size=10)
     fig_type.update_layout(
-        title="Utgående vs retur — trend",
         xaxis_title="", yaxis_title="SEK", height=350,
-        margin=dict(l=10, r=20, t=40, b=20),
+        margin=dict(l=10, r=20, t=30, b=20),
         font=dict(family="DM Sans, sans-serif"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+    st.markdown("#### Utgående vs retur — trend")
     st.plotly_chart(fig_type, use_container_width=True)
 
     # ── Chart 4: Top countries over time ─────────────────────────────────
@@ -808,16 +838,20 @@ def show_trends(df, invoices_df):
     country_trend = country_trend.sort_values("Period")
 
     fig_country = px.line(
-        country_trend, x="Period", y="Total", color="Land",
-        markers=True, color_discrete_sequence=px.colors.qualitative.Set2,
+        country_trend, x="Period", y="Total",
+        facet_col="Land", facet_col_wrap=3,
+        markers=True, color_discrete_sequence=["#2171b5"],
     )
+    fig_country.update_yaxes(matches=None, showticklabels=True, title_text="")
+    fig_country.update_xaxes(title_text="", tickangle=-45)
+    fig_country.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1], font=dict(size=13)))
+    fig_country.update_traces(line=dict(width=2))
     fig_country.update_layout(
-        title="Kostnadstrend — topp 6 länder",
-        xaxis_title="", yaxis_title="SEK", height=350,
+        height=500, showlegend=False,
         margin=dict(l=10, r=20, t=40, b=20),
         font=dict(family="DM Sans, sans-serif"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
+    st.markdown("#### Kostnadstrend — topp 6 länder")
     st.plotly_chart(fig_country, use_container_width=True)
 
     # ── Period comparison table ───────────────────────────────────────────
@@ -844,6 +878,23 @@ def show_trends(df, invoices_df):
     display_pd["Snitt / kolli"] = display_pd["Snitt / kolli"].map("{:,.1f}".format)
     display_pd.columns = ["Period", "Transportörer", "Totalt (SEK)", "Kolli", "Länder", "Rader", "Snitt/kolli (SEK)"]
     st.dataframe(display_pd, use_container_width=True, hide_index=True)
+
+    try:
+        import io as _io
+        _buf = _io.BytesIO()
+        with pd.ExcelWriter(_buf, engine="openpyxl") as _w:
+            period_detail.to_excel(_w, index=False, sheet_name="Periodöversikt")
+            carrier_period.to_excel(_w, index=False, sheet_name="Per transportör")
+            country_trend.to_excel(_w, index=False, sheet_name="Topp länder")
+        st.download_button(
+            "⬇️ Exportera trender (Excel)",
+            data=_buf.getvalue(),
+            file_name=f"shipsplit_trender_{pd.Timestamp.now():%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_trends_xlsx",
+        )
+    except Exception as _e:
+        st.caption(f"Excel-export ej tillgänglig: {_e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1048,7 +1099,7 @@ def show_analysis(df, invoice_total=None, n_files=1, overhead=None):
 
     # Downloads
     st.markdown("---")
-    dl1, dl2 = st.columns(2)
+    dl1, dl2, dl3 = st.columns(3)
     with dl1:
         st.download_button("📥 Sammanfattning (CSV)",
                            country_table.to_csv(index=False, sep=";", decimal=","),
@@ -1057,6 +1108,22 @@ def show_analysis(df, invoice_total=None, n_files=1, overhead=None):
         st.download_button("📥 Alla rader (CSV)",
                            df.to_csv(index=False, sep=";", decimal=","),
                            file_name="shipsplit_detalj.csv", mime="text/csv")
+    with dl3:
+        try:
+            import io as _io
+            _buf = _io.BytesIO()
+            with pd.ExcelWriter(_buf, engine="openpyxl") as _w:
+                country_table.to_excel(_w, index=False, sheet_name="Sammanfattning")
+                df.to_excel(_w, index=False, sheet_name="Alla rader")
+            st.download_button(
+                "⬇️ Exportera (Excel)",
+                data=_buf.getvalue(),
+                file_name=f"shipsplit_analys_{pd.Timestamp.now():%Y-%m-%d}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_analysis_xlsx",
+            )
+        except Exception as _e:
+            st.caption(f"Excel-export ej tillgänglig: {_e}")
 
     # Raw data expander
     with st.expander(f"Visa alla {n_lines} rader"):
@@ -1321,11 +1388,46 @@ def page_history():
 
     display_inv = filtered[["Period", "filename", "carrier", "invoice_total", "parsed_total"]].copy()
     display_inv.columns = ["Period", "Filnamn", "Transportör", "Fakturabelopp", "Parsad summa"]
+
+    def _coverage(row):
+        inv_t = row["Fakturabelopp"]
+        par_t = row["Parsad summa"]
+        if pd.isna(inv_t) or pd.isna(par_t) or inv_t == 0:
+            return None
+        return par_t / inv_t * 100
+
+    coverage_vals = display_inv.apply(_coverage, axis=1)
+
+    def _fmt_coverage(v):
+        if v is None or pd.isna(v):
+            return "—"
+        marker = "🔴 " if v < 98 else ("🟡 " if v < 99.5 else "")
+        return f"{marker}{v:.1f}%"
+
+    display_inv["Täckning"] = coverage_vals.apply(_fmt_coverage)
     display_inv["Fakturabelopp"] = display_inv["Fakturabelopp"].apply(
         lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
     display_inv["Parsad summa"] = display_inv["Parsad summa"].apply(
         lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
     st.dataframe(display_inv, use_container_width=True, hide_index=True)
+
+    # Export button for the invoice table
+    try:
+        import io
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            filtered[["Period", "filename", "carrier", "invoice_total", "parsed_total"]].assign(
+                Täckning=coverage_vals.values
+            ).to_excel(writer, index=False, sheet_name="Fakturor")
+        st.download_button(
+            "⬇️ Exportera fakturalista (Excel)",
+            data=buf.getvalue(),
+            file_name=f"shipsplit_fakturor_{pd.Timestamp.now():%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_invoices",
+        )
+    except Exception:
+        pass
 
     # ── Load shipments ───────────────────────────────────────────────────
     invoice_ids = filtered["id"].tolist()
