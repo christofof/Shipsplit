@@ -970,6 +970,40 @@ def show_trends(df, invoices_df):
     st.markdown("#### Kostnadstrend — topp 6 länder")
     st.plotly_chart(fig_country, use_container_width=True)
 
+    # ── Chart 5: Cost per parcel, top 6 countries (small multiples) ──────
+    country_kolli = (
+        df[(df["Land"].isin(top_countries)) & (df["Kolli"] > 0)]
+        .groupby(["Period", "Land"])
+        .agg(Total=("Belopp (SEK)", "sum"), Kolli=("Kolli", "sum"))
+        .reset_index()
+    )
+    country_kolli["Snitt / kolli"] = (country_kolli["Total"] / country_kolli["Kolli"]).round(1)
+    country_kolli["Period"] = pd.Categorical(country_kolli["Period"], categories=period_labels, ordered=True)
+    country_kolli = country_kolli.sort_values("Period")
+
+    # Preserve the same country order as the total-cost chart (top by total spend),
+    # so the two facet grids are visually aligned.
+    country_kolli["Land"] = pd.Categorical(country_kolli["Land"], categories=top_countries, ordered=True)
+    country_kolli = country_kolli.sort_values(["Land", "Period"])
+
+    fig_per_kolli = px.line(
+        country_kolli, x="Period", y="Snitt / kolli",
+        facet_col="Land", facet_col_wrap=3,
+        markers=True, color_discrete_sequence=["#cb4b16"],
+    )
+    fig_per_kolli.update_yaxes(matches=None, showticklabels=True, title_text="")
+    fig_per_kolli.update_xaxes(title_text="", tickangle=-45)
+    fig_per_kolli.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1], font=dict(size=13)))
+    fig_per_kolli.update_traces(line=dict(width=2))
+    fig_per_kolli.update_layout(
+        height=500, showlegend=False,
+        margin=dict(l=10, r=20, t=40, b=20),
+        font=dict(family="DM Sans, sans-serif"),
+    )
+    st.markdown("#### Snitt per kolli — topp 6 länder (SEK/kolli)")
+    st.caption("Samma länder som ovan, sorterade på total kostnad. Y-axlarna är oberoende.")
+    st.plotly_chart(fig_per_kolli, use_container_width=True)
+
     # ── Period comparison table ───────────────────────────────────────────
     st.markdown("---")
     st.subheader("Periodöversikt")
@@ -1002,6 +1036,7 @@ def show_trends(df, invoices_df):
             period_detail.to_excel(_w, index=False, sheet_name="Periodöversikt")
             carrier_period.to_excel(_w, index=False, sheet_name="Per transportör")
             country_trend.to_excel(_w, index=False, sheet_name="Topp länder")
+            country_kolli.to_excel(_w, index=False, sheet_name="Snitt per kolli")
         st.download_button(
             "⬇️ Exportera trender (Excel)",
             data=_buf.getvalue(),
