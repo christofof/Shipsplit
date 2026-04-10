@@ -622,7 +622,13 @@ def init_supabase():
 
 
 def save_invoice(sb, filename, carrier, invoice_total, parsed_total, df, dates=None, overhead=None):
-    """Save parsed invoice and shipment rows to Supabase."""
+    """Save parsed invoice and shipment rows to Supabase.
+
+    Replace-by-filename semantics: if a row with the same filename already
+    exists, its shipments and invoice record are deleted first. This makes
+    re-uploading a fakura after a parser fix idempotent — the user never
+    ends up with duplicate or stale rows.
+    """
     record = {
         "filename": filename,
         "carrier": carrier,
@@ -638,6 +644,18 @@ def save_invoice(sb, filename, carrier, invoice_total, parsed_total, df, dates=N
             record["period_end"] = dates["period_end"]
     if overhead:
         record["overhead"] = json.dumps(overhead)
+
+    # ── Replace-by-filename: delete any existing invoice(s) with same name ──
+    try:
+        existing = sb.table("invoices").select("id").eq("filename", filename).execute()
+        if existing.data:
+            old_ids = [r["id"] for r in existing.data]
+            # Delete shipments first (no CASCADE assumed)
+            for oid in old_ids:
+                sb.table("shipments").delete().eq("invoice_id", oid).execute()
+            sb.table("invoices").delete().in_("id", old_ids).execute()
+    except Exception:
+        pass  # If delete fails, fall through to insert — worst case is a duplicate
 
     inv = sb.table("invoices").insert(record).execute()
 
@@ -1388,14 +1406,49 @@ def page_history():
         st.info("Inga fakturor uppladdade ännu. Gå till **Ladda upp** för att börja.")
         return
 
+    # ── Admin: cleanup stale records (missing period_start) ─────────────
+    stale_mask = invoices_df["period_start"].isna() | (
+        invoices_df["period_start"].astype(str).str.strip().isin(["None", "NaT", "nan", "NaN", ""])
+    )
+    n_stale = int(stale_mask.sum())
+    if n_stale > 0:
+        with st.expander(f"⚠️ {n_stale} fakturor saknar period — städa upp", expanded=False):
+            st.caption(
+                "Dessa rader skrevs innan datumparsningen var korrekt. Ta bort dem och ladda "
+                "upp motsvarande PDF:er igen — den uppdaterade parsern extraherar nu datum korrekt."
+            )
+            stale_rows = invoices_df[stale_mask][["filename", "carrier", "invoice_total", "parsed_total"]].copy()
+            st.dataframe(stale_rows, use_container_width=True, hide_index=True)
+
+            confirm = st.checkbox("Ja, ta bort dessa gamla rader permanent")
+            if st.button("🗑️ Ta bort markerade gamla rader", disabled=not confirm, type="primary"):
+                stale_ids = invoices_df.loc[stale_mask, "id"].tolist()
+                deleted = 0
+                for sid in stale_ids:
+                    try:
+                        sb.table("shipments").delete().eq("invoice_id", sid).execute()
+                        sb.table("invoices").delete().eq("id", sid).execute()
+                        deleted += 1
+                    except Exception as e:
+                        st.error(f"Kunde inte ta bort {sid}: {e}")
+                st.success(f"✅ {deleted} gamla rader borttagna. Ladda upp PDF:erna på nytt.")
+                st.rerun()
+
     # Parse dates safely as strings for display, timestamps for sorting
     invoices_df["upload_date"] = pd.to_datetime(invoices_df["upload_date"], errors="coerce")
+
+    NULL_STRS = {"None", "NaT", "nan", "NaN", "", "null", "None "}
+
+    def _is_null(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return True
+        return str(v).strip() in NULL_STRS
 
     def safe_date_str(row):
         """Build a display string for the period."""
         ps = row.get("period_start")
         pe = row.get("period_end")
-        if ps and pe and str(ps) != "None" and str(pe) != "None":
+        if not _is_null(ps) and not _is_null(pe):
             return f"{str(ps)[:10]} — {str(pe)[:10]}"
         ud = row.get("upload_date")
         if pd.notna(ud):
@@ -1407,7 +1460,7 @@ def page_history():
     # Sort date for filtering (use period_start string → date, fallback to upload_date)
     def safe_sort_date(row):
         ps = row.get("period_start")
-        if ps and str(ps) not in ("None", "NaT", ""):
+        if not _is_null(ps):
             try:
                 return pd.Timestamp(str(ps)[:10])
             except Exception:
