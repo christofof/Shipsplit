@@ -111,19 +111,10 @@ def detect_carrier(text: str) -> str:
 
 
 def parse_ups_invoice(pdf_file):
-    # Extract text page by page to manage memory
-    lines = []
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                lines.extend(t.split("\n"))
-    # PDF is now closed and memory released
+    """Streaming UPS parser — processes one page at a time and releases page
+    cache immediately. Safe for very large invoices (1000+ pages, 10+ MB)."""
 
-    full_text = "\n".join(lines)  # needed for overhead regex
-    records = []
-
-    # Format 1: Outbound (Mottagare → Total kostnad för sändning)
+    # Pre-compile all regexes once
     mottagare_re = re.compile(r"Mottagare:\s+.+\s(\S+)\s*$")
     total_re = re.compile(
         r"Total kostnad för sändning\s+(\S+)\s+SEK\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)"
@@ -131,108 +122,137 @@ def parse_ups_invoice(pdf_file):
     total_re_2 = re.compile(
         r"Total kostnad för sändning\s+(\S+)\s+SEK\s+([\d.,]+)\s+([\d.,]+)\s*$"
     )
-
-    current_country = None
-    for line in lines:
-        mm = mottagare_re.search(line)
-        if mm:
-            current_country = normalize_country(mm.group(1))
-            continue
-        if "Total kostnad för sändning" in line and current_country:
-            tm = total_re.search(line)
-            if tm:
-                records.append({
-                    "Land": current_country, "Belopp (SEK)": parse_swedish_number(tm.group(4)),
-                    "Kolli": 1, "Typ": "Utgående", "Detalj": tm.group(1),
-                })
-                current_country = None
-                continue
-            tm2 = total_re_2.search(line)
-            if tm2:
-                records.append({
-                    "Land": current_country, "Belopp (SEK)": parse_swedish_number(tm2.group(3)),
-                    "Kolli": 1, "Typ": "Utgående", "Detalj": tm2.group(1),
-                })
-                current_country = None
-
-    # Format 2: Returns (Skickat från / Avsändare → Totalkostnad)
     skickat_re = re.compile(r"Skickat från:.*\s([A-ZÅÄÖÜ][A-ZÅÄÖÜ\s]+)\s*$")
     avsandare_re = re.compile(r"Avsändare:.*\s([A-ZÅÄÖÜ][A-ZÅÄÖÜ\s]+)\s*$")
     totalkostnad_re = re.compile(
         r"Totalkostnad\s+SEK\s+[\d.,]+\s+(?:[\d.,]+\s+)?[\d.,]+\s+([\d.,]+)\s*$"
     )
-    current_country = None
-    current_section = None
+    momspl_re = re.compile(r"Totalt momspliktigt\s+([\d.,]+)")
+    icke_re = re.compile(r"Icke momspliktigt\s+([\d.,]+)")
+    privat_re = re.compile(r"Totala justeringar för leveverans till privatadresser\s+SEK\s+([\d.,]+)\s+([\d.,]+)")
+    sasong_re = re.compile(r"Totalkostnad för just\. av säsongsbas\. tilläggsavg\.\s+SEK\s+([\d.,]+)\s+([\d.,]+)")
+    adress_re = re.compile(r"Total kostnad för adressändring\s+SEK\s+([\d.,]+)\s+([\d.,]+)")
+    justeringar_re = re.compile(r"Totala justeringar\s+SEK\s+([\d.,]+)\s+([\d.,]+)")
 
-    for line in lines:
-        s = line.strip()
-        if "UPS Returns" in s:
-            current_section = "Retur"
-        elif "importsändningar" in s.lower():
-            current_section = "Retur"
-        elif "icke levererbara returer" in s.lower():
-            current_section = "Retur"
-        elif "upphämtningsbegäran" in s.lower():
-            current_section = "Övrigt"
-
-        sm = skickat_re.search(line)
-        if sm:
-            current_country = normalize_country(sm.group(1))
-            continue
-        am = avsandare_re.search(line)
-        if am:
-            current_country = normalize_country(am.group(1))
-            continue
-        if "Totalkostnad" in line and "SEK" in line and current_country:
-            tm = totalkostnad_re.search(line)
-            if tm:
-                records.append({
-                    "Land": current_country, "Belopp (SEK)": parse_swedish_number(tm.group(1)),
-                    "Kolli": 1, "Typ": current_section or "Retur",
-                    "Detalj": current_section or "Retur",
-                })
-                current_country = None
-
-    # Invoice total
-    invoice_total = None
-    momspliktigt = icke_moms = 0.0
-    for line in lines:
-        m = re.search(r"Totalt momspliktigt\s+([\d.,]+)", line)
-        if m:
-            momspliktigt = parse_swedish_number(m.group(1))
-        m2 = re.search(r"Icke momspliktigt\s+([\d.,]+)", line)
-        if m2:
-            icke_moms = parse_swedish_number(m2.group(1))
-    if momspliktigt > 0 or icke_moms > 0:
-        invoice_total = momspliktigt + icke_moms
-
-    # Extract overhead charges
-    overhead = []
+    records = []
+    # Outbound state (format 1)
+    cur_out_country = None
+    # Return state (format 2)
+    cur_ret_country = None
+    cur_section = None
+    # Totals
+    momspliktigt = 0.0
+    icke_moms = 0.0
     privatadress_total = 0.0
     sasong_total = 0.0
     adress_total = 0.0
     justeringar_total = 0.0
 
-    for line in lines:
-        # Residential delivery surcharge
-        m = re.search(r"Totala justeringar för leveverans till privatadresser\s+SEK\s+([\d.,]+)\s+([\d.,]+)", line)
+    # Line-processing closure that updates all the state above.
+    def _process_line(line):
+        nonlocal cur_out_country, cur_ret_country, cur_section
+        nonlocal momspliktigt, icke_moms
+        nonlocal privatadress_total, sasong_total, adress_total, justeringar_total
+
+        # ── Format 1: Outbound ──
+        mm = mottagare_re.search(line)
+        if mm:
+            cur_out_country = normalize_country(mm.group(1))
+        elif "Total kostnad för sändning" in line and cur_out_country:
+            tm = total_re.search(line)
+            if tm:
+                records.append({
+                    "Land": cur_out_country,
+                    "Belopp (SEK)": parse_swedish_number(tm.group(4)),
+                    "Kolli": 1, "Typ": "Utgående", "Detalj": tm.group(1),
+                })
+                cur_out_country = None
+            else:
+                tm2 = total_re_2.search(line)
+                if tm2:
+                    records.append({
+                        "Land": cur_out_country,
+                        "Belopp (SEK)": parse_swedish_number(tm2.group(3)),
+                        "Kolli": 1, "Typ": "Utgående", "Detalj": tm2.group(1),
+                    })
+                    cur_out_country = None
+
+        # ── Format 2: Returns ──
+        s_lower = line.lower()
+        if "UPS Returns" in line:
+            cur_section = "Retur"
+        elif "importsändningar" in s_lower:
+            cur_section = "Retur"
+        elif "icke levererbara returer" in s_lower:
+            cur_section = "Retur"
+        elif "upphämtningsbegäran" in s_lower:
+            cur_section = "Övrigt"
+
+        sm = skickat_re.search(line)
+        if sm:
+            cur_ret_country = normalize_country(sm.group(1))
+        else:
+            am = avsandare_re.search(line)
+            if am:
+                cur_ret_country = normalize_country(am.group(1))
+            elif "Totalkostnad" in line and "SEK" in line and cur_ret_country:
+                tm = totalkostnad_re.search(line)
+                if tm:
+                    records.append({
+                        "Land": cur_ret_country,
+                        "Belopp (SEK)": parse_swedish_number(tm.group(1)),
+                        "Kolli": 1,
+                        "Typ": cur_section or "Retur",
+                        "Detalj": cur_section or "Retur",
+                    })
+                    cur_ret_country = None
+
+        # ── Invoice total accumulators ──
+        m = momspl_re.search(line)
+        if m:
+            momspliktigt = parse_swedish_number(m.group(1))
+        m = icke_re.search(line)
+        if m:
+            icke_moms = parse_swedish_number(m.group(1))
+
+        # ── Overhead accumulators ──
+        m = privat_re.search(line)
         if m:
             privatadress_total += parse_swedish_number(m.group(2))
-
-        # Seasonal surcharge
-        m = re.search(r"Totalkostnad för just\. av säsongsbas\. tilläggsavg\.\s+SEK\s+([\d.,]+)\s+([\d.,]+)", line)
+        m = sasong_re.search(line)
         if m:
             sasong_total += parse_swedish_number(m.group(2))
-
-        # Address corrections
-        m = re.search(r"Total kostnad för adressändring\s+SEK\s+([\d.,]+)\s+([\d.,]+)", line)
+        m = adress_re.search(line)
         if m:
             adress_total += parse_swedish_number(m.group(2))
-
-        # Total adjustments (includes all sub-categories)
-        m = re.search(r"Totala justeringar\s+SEK\s+([\d.,]+)\s+([\d.,]+)", line)
+        m = justeringar_re.search(line)
         if m:
             justeringar_total += parse_swedish_number(m.group(2))
+
+    # ── Chunked open/close to bound memory on very large invoices ──
+    # pdfplumber leaks ~2.5 MB/page inside a single open(); closing between
+    # chunks resets the internal caches so peak RAM stays ~flat.
+    with pdfplumber.open(pdf_file) as pdf:
+        n_pages = len(pdf.pages)
+    CHUNK = 50 if n_pages and n_pages > 200 else (n_pages or 1)
+
+    import gc
+    for start in range(0, n_pages, CHUNK):
+        end = min(start + CHUNK, n_pages)
+        with pdfplumber.open(pdf_file) as pdf:
+            for i in range(start, end):
+                t = pdf.pages[i].extract_text()
+                if not t:
+                    continue
+                for line in t.split("\n"):
+                    _process_line(line)
+        gc.collect()
+
+    invoice_total = None
+    if momspliktigt > 0 or icke_moms > 0:
+        invoice_total = momspliktigt + icke_moms
+
+    overhead = []
 
     # Weight corrections = total justeringar minus known sub-categories
     vikt_total = max(0, justeringar_total - privatadress_total - sasong_total)
@@ -435,7 +455,14 @@ def extract_invoice_dates(pdf_file):
         months_sv = {"januari": "01", "februari": "02", "mars": "03", "april": "04",
                      "maj": "05", "juni": "06", "juli": "07", "augusti": "08",
                      "september": "09", "oktober": "10", "november": "11", "december": "12"}
-        m = re.search(r"Fakturadatum\s*\n?\s*(\d{1,2})\s+(\w+)\s+(\d{4})", text)
+        # Allow arbitrary content (e.g. <I>...</I> XML tags) between "Fakturadatum"
+        # and the actual date on PDFs with interleaved metadata.
+        month_alt = "|".join(months_sv.keys())
+        m = re.search(
+            rf"Fakturadatum[\s\S]{{0,200}}?(\d{{1,2}})\s+({month_alt})\s+(\d{{4}})",
+            text,
+            re.IGNORECASE,
+        )
         if m:
             day, month_name, year = m.group(1), m.group(2).lower(), m.group(3)
             if month_name in months_sv:
