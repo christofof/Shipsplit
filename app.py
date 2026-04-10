@@ -639,18 +639,20 @@ def show_trends(df, invoices_df):
         inv_date = row.get("invoice_date")
         carrier = row.get("carrier", "")
 
+        NULL_STRS = ("None", "NaT", "nan", "NaN", "")
+
         # Best available date for this invoice
-        if ps and str(ps) not in ("None", "NaT", ""):
+        if ps and str(ps) not in NULL_STRS:
             sort_key = str(ps)[:10]
-        elif inv_date and str(inv_date) not in ("None", "NaT", ""):
+        elif inv_date and str(inv_date) not in NULL_STRS:
             sort_key = str(inv_date)[:10]
         else:
             sort_key = "9999-99-99"
 
         # Period label
-        if ps and pe and str(ps) not in ("None", "NaT", "") and str(pe) not in ("None", "NaT", ""):
+        if ps and pe and str(ps) not in NULL_STRS and str(pe) not in NULL_STRS:
             label = f"{str(ps)[:10]} — {str(pe)[:10]}"
-        elif inv_date and str(inv_date) not in ("None", "NaT", ""):
+        elif inv_date and str(inv_date) not in NULL_STRS:
             label = str(inv_date)[:10]
         else:
             label = "Okänt datum"
@@ -697,8 +699,10 @@ def show_trends(df, invoices_df):
             return f"{sign}{change:.1f}%"
 
         kc1, kc2, kc3 = st.columns(3)
+        curr_label = str(curr["Period"])
+        curr_short = curr_label[:10] if curr_label not in ("Okänt datum",) else curr_label
         kc1.metric(
-            f"Totalkostnad ({curr['Period'][:10]}…)",
+            f"Totalkostnad ({curr_short})",
             f"{curr['Total']:,.0f} SEK",
             delta_str(curr["Total"], prev["Total"]),
             delta_color="inverse",
@@ -1334,53 +1338,62 @@ def page_history():
         st.warning("Inga sändningar hittade för de valda fakturorna.")
         return
 
-    # ── Tabs: Trender + Översikt ─────────────────────────────────────────
+    # ── Shared shipment-level filters (apply to both tabs) ──────────────
     st.markdown("---")
+    st.subheader("Sändningsfilter")
+    sf1, sf2 = st.columns(2)
+
+    with sf1:
+        countries = sorted(df["Land"].unique())
+        sel_countries = st.multiselect(
+            "Land", countries, default=countries,
+            help="Filtrerar både Trender och Översikt",
+        )
+
+    with sf2:
+        types = sorted(df["Typ"].dropna().unique()) if "Typ" in df.columns else []
+        if types:
+            sel_types = st.multiselect(
+                "Typ", types, default=types,
+                help="Utgående, Retur, Övrigt — filtrerar båda vyerna",
+            )
+        else:
+            sel_types = []
+
+    # Apply shipment-level filters once
+    df_filtered = df[df["Land"].isin(sel_countries)].copy()
+    if types and sel_types:
+        df_filtered = df_filtered[df_filtered["Typ"].isin(sel_types)]
+
+    filters_active = (sel_countries != countries) or (bool(types) and sel_types != types)
+
+    if df_filtered.empty:
+        st.warning("Inga sändningar matchar filtret.")
+        return
+
+    # ── Tabs: Trender + Översikt ─────────────────────────────────────────
     tab_trends, tab_overview = st.tabs(["📈 Trender", "📊 Översikt"])
 
     with tab_trends:
-        show_trends(df, filtered)
+        show_trends(df_filtered, filtered)
 
     with tab_overview:
-        # ── Shipment-level filters ───────────────────────────────────────
-        sf1, sf2 = st.columns(2)
+        # Recalculate invoice total for filtered view
+        total_inv_view = None if filters_active else total_inv
 
-        with sf1:
-            countries = sorted(df["Land"].unique())
-            sel_countries = st.multiselect("Land", countries, default=countries,
-                                           help="Filtrera analysen på specifika länder")
+        # Load overhead from stored invoices (skip if shipment filters active)
+        all_overhead = []
+        if not filters_active:
+            for _, inv_row in filtered.iterrows():
+                oh_json = inv_row.get("overhead")
+                if oh_json and isinstance(oh_json, str):
+                    try:
+                        all_overhead.extend(json.loads(oh_json))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
-        with sf2:
-            types = sorted(df["Typ"].dropna().unique()) if "Typ" in df.columns else []
-            if types:
-                sel_types = st.multiselect("Typ", types, default=types,
-                                           help="Utgående, Retur, Övrigt")
-
-        # Apply shipment-level filters
-        df_filtered = df[df["Land"].isin(sel_countries)].copy()
-        if types and sel_types:
-            df_filtered = df_filtered[df_filtered["Typ"].isin(sel_types)]
-
-        if df_filtered.empty:
-            st.warning("Inga sändningar matchar filtret.")
-        else:
-            # Recalculate invoice total for filtered view
-            filters_active = sel_countries != countries or (types and sel_types != types)
-            total_inv_view = None if filters_active else total_inv
-
-            # Load overhead from stored invoices (skip if shipment filters active)
-            all_overhead = []
-            if not filters_active:
-                for _, inv_row in filtered.iterrows():
-                    oh_json = inv_row.get("overhead")
-                    if oh_json and isinstance(oh_json, str):
-                        try:
-                            all_overhead.extend(json.loads(oh_json))
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-
-            show_analysis(df_filtered, invoice_total=total_inv_view, n_files=len(filtered),
-                          overhead=all_overhead if all_overhead else None)
+        show_analysis(df_filtered, invoice_total=total_inv_view, n_files=len(filtered),
+                      overhead=all_overhead if all_overhead else None)
 
     # ── Delete invoice ───────────────────────────────────────────────────
     st.markdown("---")
