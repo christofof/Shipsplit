@@ -292,6 +292,28 @@ def parse_bring_invoice(pdf_file):
                 "Detalj": service,
             })
 
+    # ── Fallback for manual/simple Bring invoices (e.g. reminders, storage) ──
+    if not records:
+        manual_re = re.compile(
+            r"^\d+\s+\d+\s+\d+\s+(.+?)\s+(\d+)\s+St\s+([\d\s,]+)\s+(?:[\d.]+\s+)?(?:Export|Local VAT)\s+([\d\s,]+)$"
+        )
+        # Try to extract origin country from order line (POO/POA)
+        country_m = re.search(r"POO:\s*\d+\s+([A-Z]{2})", full_text)
+        fallback_country = normalize_country(country_m.group(1)) if country_m else "Okänt"
+
+        for line in lines:
+            m = manual_re.match(line.strip())
+            if m:
+                service = m.group(1).strip()
+                qty = int(m.group(2))
+                amount = float(m.group(4).replace(" ", "").replace(",", "."))
+                is_return = "Return" in service
+                records.append({
+                    "Land": fallback_country, "Belopp (SEK)": amount,
+                    "Kolli": qty, "Typ": "Retur" if is_return else "Utgående",
+                    "Detalj": service,
+                })
+
     invoice_total = None
     m = re.search(r"Summa exkl\.?\s*moms\s+([\d\s.,]+)", full_text)
     if m:
@@ -307,22 +329,30 @@ def parse_dhl_freight_invoice(pdf_file):
             if t:
                 full_text += t + "\n"
 
+    # ── Map of all known DHL Freight service types ──
+    DHL_SERVICE_MAP = {
+        "SERVPOINT B2C": ("Servpoint B2C", "Utgående"),
+        "SERVPOINT C2B": ("Servpoint C2B", "Retur"),
+        "HOME DELIVERY": ("Home Delivery", "Utgående"),
+        "HEMLEVERANS PAKET": ("Hemleverans Paket", "Utgående"),
+        "DHL PAKET": ("Dhl Paket", "Utgående"),
+    }
+
     lines = full_text.split("\n")
-    records = []
-    current_service = current_city = None
+    spec_records = []
+    current_service = current_typ = current_city = None
 
     for line in lines:
         s = line.strip()
         if re.match(r"^A\s+\d{3}\s", s):
-            if "SERVPOINT B2C" in s:
-                current_service = "Servpoint B2C"
-            elif "SERVPOINT C2B" in s:
-                current_service = "Servpoint C2B"
-            elif "HOME DELIVERY" in s:
-                current_service = "Home Delivery"
-            else:
-                current_service = None
+            current_service = current_typ = None
             current_city = None
+            s_upper = s.upper()
+            for key, (name, typ) in DHL_SERVICE_MAP.items():
+                if key in s_upper:
+                    current_service = name
+                    current_typ = typ
+                    break
         elif re.match(r"^B\s+\d", s) and current_service:
             parts = s.split()
             if len(parts) >= 3:
@@ -330,28 +360,36 @@ def parse_dhl_freight_invoice(pdf_file):
         elif re.match(r"^D\s", s) and current_service and "Tilläggs" not in s:
             m = re.search(r"(\d+)\s+(\d+)\s+(\d+,\d{2})\s*$", s)
             if m:
-                records.append({
+                spec_records.append({
                     "Land": "Sverige", "Belopp (SEK)": float(m.group(3).replace(",", ".")),
                     "Kolli": int(m.group(2)),
-                    "Typ": "Retur" if current_service == "Servpoint C2B" else "Utgående",
+                    "Typ": current_typ,
                     "Detalj": f"{current_service} → {current_city or '?'}",
                 })
-                current_service = current_city = None
+                current_service = current_typ = current_city = None
 
-    if not records:
-        summary_re = re.compile(
-            r"(HOME DELIVERY|SERVPOINT B2C|SERVPOINT C2B)\s+(\d+)\s+([\d\s,]+?)(?:\s*\*)?$",
-            re.MULTILINE,
-        )
-        for m in summary_re.finditer(full_text):
-            service = m.group(1).title()
-            count = int(m.group(2))
-            amount = float(m.group(3).strip().replace(" ", "").replace(",", "."))
-            records.append({
-                "Land": "Sverige", "Belopp (SEK)": amount, "Kolli": count,
-                "Typ": "Retur" if "C2B" in m.group(1).upper() else "Utgående",
-                "Detalj": service,
-            })
+    # ── Summary fallback — always try, use if better coverage ──
+    summary_records = []
+    service_pattern = "|".join(re.escape(k) for k in DHL_SERVICE_MAP)
+    summary_re = re.compile(
+        rf"({service_pattern})\s+(\d+)\s+([\d\s,]+?)(?:\s*\*)?$",
+        re.MULTILINE,
+    )
+    for m in summary_re.finditer(full_text):
+        key = m.group(1).upper().strip()
+        name, typ = DHL_SERVICE_MAP.get(key, (m.group(1).title(), "Utgående"))
+        count = int(m.group(2))
+        amount = float(m.group(3).strip().replace(" ", "").replace(",", "."))
+        summary_records.append({
+            "Land": "Sverige", "Belopp (SEK)": amount, "Kolli": count,
+            "Typ": typ,
+            "Detalj": name,
+        })
+
+    # Use whichever method captured more revenue
+    spec_total = sum(r["Belopp (SEK)"] for r in spec_records) if spec_records else 0
+    summary_total = sum(r["Belopp (SEK)"] for r in summary_records) if summary_records else 0
+    records = spec_records if spec_total >= summary_total else summary_records
 
     invoice_total = None
     m = re.search(r"Summa exkl\.?\s*moms\s+([\d\s.,]+)", full_text)
@@ -552,6 +590,229 @@ def check_duplicate(sb, filename):
 def delete_invoice(sb, invoice_id):
     """Delete an invoice and its shipments (cascade)."""
     sb.table("invoices").delete().eq("id", invoice_id).execute()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIME-SERIES DASHBOARD (Phase 2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def show_trends(df, invoices_df):
+    """Render time-series trend charts.
+
+    df: shipments DataFrame (Land, Belopp (SEK), Kolli, Typ, invoice_id, carrier)
+    invoices_df: filtered invoices with period dates
+    """
+
+    # ── Build a period lookup: invoice_id → period label + sort key ──────
+    inv_lookup = {}
+    for _, row in invoices_df.iterrows():
+        inv_id = row["id"]
+        ps = row.get("period_start")
+        pe = row.get("period_end")
+        inv_date = row.get("invoice_date")
+        carrier = row.get("carrier", "")
+
+        # Best available date for this invoice
+        if ps and str(ps) not in ("None", "NaT", ""):
+            sort_key = str(ps)[:10]
+        elif inv_date and str(inv_date) not in ("None", "NaT", ""):
+            sort_key = str(inv_date)[:10]
+        else:
+            sort_key = "9999-99-99"
+
+        # Period label
+        if ps and pe and str(ps) not in ("None", "NaT", "") and str(pe) not in ("None", "NaT", ""):
+            label = f"{str(ps)[:10]} — {str(pe)[:10]}"
+        elif inv_date and str(inv_date) not in ("None", "NaT", ""):
+            label = str(inv_date)[:10]
+        else:
+            label = "Okänt datum"
+
+        inv_lookup[inv_id] = {"sort_key": sort_key, "label": label, "carrier": carrier}
+
+    # Attach period info to shipments
+    df = df.copy()
+    df["period_sort"] = df["invoice_id"].map(lambda x: inv_lookup.get(x, {}).get("sort_key", "9999"))
+    df["Period"] = df["invoice_id"].map(lambda x: inv_lookup.get(x, {}).get("label", "Okänt"))
+    df["Transportör"] = df["invoice_id"].map(lambda x: inv_lookup.get(x, {}).get("carrier", ""))
+
+    # Sort periods chronologically
+    period_order = sorted(df[["period_sort", "Period"]].drop_duplicates().values.tolist())
+    period_labels = [p[1] for p in period_order]
+
+    if len(period_labels) < 2:
+        st.info("Trendvyn kräver data från minst två perioder. Ladda upp fler fakturor.")
+        return
+
+    # ── Aggregate by period ──────────────────────────────────────────────
+    period_agg = (
+        df.groupby("Period")
+        .agg(
+            Total=("Belopp (SEK)", "sum"),
+            Kolli=("Kolli", "sum"),
+        )
+        .reindex(period_labels)
+        .reset_index()
+    )
+    period_agg["Snitt / kolli"] = (period_agg["Total"] / period_agg["Kolli"]).round(1)
+    period_agg["Snitt / kolli"] = period_agg["Snitt / kolli"].fillna(0)
+
+    # ── KPI cards: latest period vs previous ─────────────────────────────
+    if len(period_agg) >= 2:
+        curr = period_agg.iloc[-1]
+        prev = period_agg.iloc[-2]
+
+        def delta_str(curr_val, prev_val, unit="SEK", invert=False):
+            if prev_val == 0:
+                return None
+            change = (curr_val - prev_val) / prev_val * 100
+            sign = "+" if change > 0 else ""
+            return f"{sign}{change:.1f}%"
+
+        kc1, kc2, kc3 = st.columns(3)
+        kc1.metric(
+            f"Totalkostnad ({curr['Period'][:10]}…)",
+            f"{curr['Total']:,.0f} SEK",
+            delta_str(curr["Total"], prev["Total"]),
+            delta_color="inverse",
+        )
+        kc2.metric(
+            "Kolli",
+            f"{int(curr['Kolli']):,}",
+            delta_str(curr["Kolli"], prev["Kolli"]),
+        )
+        kc3.metric(
+            "Snitt / kolli",
+            f"{curr['Snitt / kolli']:,.1f} SEK",
+            delta_str(curr["Snitt / kolli"], prev["Snitt / kolli"]),
+            delta_color="inverse",
+        )
+
+    st.markdown("---")
+
+    # ── Chart 1: Total cost per period, stacked by carrier ───────────────
+    carrier_period = (
+        df.groupby(["Period", "Transportör"])
+        .agg(Total=("Belopp (SEK)", "sum"))
+        .reset_index()
+    )
+    carrier_period["Period"] = pd.Categorical(carrier_period["Period"], categories=period_labels, ordered=True)
+    carrier_period = carrier_period.sort_values("Period")
+
+    fig_cost = px.bar(
+        carrier_period, x="Period", y="Total", color="Transportör",
+        color_discrete_map={"UPS": "#2171b5", "Bring": "#43a047", "DHL Freight": "#fdd835"},
+        text="Total", barmode="stack",
+    )
+    fig_cost.update_traces(texttemplate="%{text:,.0f}", textposition="inside", textfont_size=10)
+    fig_cost.update_layout(
+        title="Total fraktkostnad per period",
+        xaxis_title="", yaxis_title="SEK", height=400,
+        margin=dict(l=10, r=20, t=40, b=20),
+        font=dict(family="DM Sans, sans-serif"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_cost, use_container_width=True)
+
+    # ── Chart 2: Cost per kolli over time, by carrier ────────────────────
+    carrier_avg = (
+        df[df["Kolli"] > 0]
+        .groupby(["Period", "Transportör"])
+        .agg(Total=("Belopp (SEK)", "sum"), Kolli=("Kolli", "sum"))
+        .reset_index()
+    )
+    carrier_avg["Snitt / kolli"] = (carrier_avg["Total"] / carrier_avg["Kolli"]).round(1)
+    carrier_avg["Period"] = pd.Categorical(carrier_avg["Period"], categories=period_labels, ordered=True)
+    carrier_avg = carrier_avg.sort_values("Period")
+
+    fig_avg = px.line(
+        carrier_avg, x="Period", y="Snitt / kolli", color="Transportör",
+        color_discrete_map={"UPS": "#2171b5", "Bring": "#43a047", "DHL Freight": "#fdd835"},
+        markers=True,
+    )
+    fig_avg.update_layout(
+        title="Kostnad per kolli — trend per transportör",
+        xaxis_title="", yaxis_title="SEK / kolli", height=350,
+        margin=dict(l=10, r=20, t=40, b=20),
+        font=dict(family="DM Sans, sans-serif"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_avg, use_container_width=True)
+
+    # ── Chart 3: Outbound vs Return over time ────────────────────────────
+    type_period = (
+        df.groupby(["Period", "Typ"])
+        .agg(Total=("Belopp (SEK)", "sum"))
+        .reset_index()
+    )
+    type_period["Period"] = pd.Categorical(type_period["Period"], categories=period_labels, ordered=True)
+    type_period = type_period.sort_values("Period")
+
+    fig_type = px.bar(
+        type_period, x="Period", y="Total", color="Typ",
+        color_discrete_map={"Utgående": "#2171b5", "Retur": "#cb4b16", "Övrigt": "#999999"},
+        barmode="stack", text="Total",
+    )
+    fig_type.update_traces(texttemplate="%{text:,.0f}", textposition="inside", textfont_size=10)
+    fig_type.update_layout(
+        title="Utgående vs retur — trend",
+        xaxis_title="", yaxis_title="SEK", height=350,
+        margin=dict(l=10, r=20, t=40, b=20),
+        font=dict(family="DM Sans, sans-serif"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_type, use_container_width=True)
+
+    # ── Chart 4: Top countries over time ─────────────────────────────────
+    country_totals = df.groupby("Land")["Belopp (SEK)"].sum().sort_values(ascending=False)
+    top_countries = country_totals.head(6).index.tolist()
+
+    country_trend = (
+        df[df["Land"].isin(top_countries)]
+        .groupby(["Period", "Land"])
+        .agg(Total=("Belopp (SEK)", "sum"))
+        .reset_index()
+    )
+    country_trend["Period"] = pd.Categorical(country_trend["Period"], categories=period_labels, ordered=True)
+    country_trend = country_trend.sort_values("Period")
+
+    fig_country = px.line(
+        country_trend, x="Period", y="Total", color="Land",
+        markers=True, color_discrete_sequence=px.colors.qualitative.Set2,
+    )
+    fig_country.update_layout(
+        title="Kostnadstrend — topp 6 länder",
+        xaxis_title="", yaxis_title="SEK", height=350,
+        margin=dict(l=10, r=20, t=40, b=20),
+        font=dict(family="DM Sans, sans-serif"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_country, use_container_width=True)
+
+    # ── Period comparison table ───────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Periodöversikt")
+    period_detail = (
+        df.groupby("Period")
+        .agg(
+            Transportörer=("Transportör", lambda x: ", ".join(sorted(x.unique()))),
+            Total=("Belopp (SEK)", "sum"),
+            Kolli=("Kolli", "sum"),
+            Länder=("Land", "nunique"),
+            Rader=("Land", "count"),
+        )
+        .reindex(period_labels)
+        .reset_index()
+    )
+    period_detail["Snitt / kolli"] = (period_detail["Total"] / period_detail["Kolli"]).round(1)
+    period_detail["Snitt / kolli"] = period_detail["Snitt / kolli"].fillna(0)
+
+    display_pd = period_detail.copy()
+    display_pd["Total"] = display_pd["Total"].map("{:,.0f}".format)
+    display_pd["Kolli"] = display_pd["Kolli"].astype(int).map("{:,}".format)
+    display_pd["Snitt / kolli"] = display_pd["Snitt / kolli"].map("{:,.1f}".format)
+    display_pd.columns = ["Period", "Transportörer", "Totalt (SEK)", "Kolli", "Länder", "Rader", "Snitt/kolli (SEK)"]
+    st.dataframe(display_pd, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1046,49 +1307,53 @@ def page_history():
         st.warning("Inga sändningar hittade för de valda fakturorna.")
         return
 
-    # ── Shipment-level filters ───────────────────────────────────────────
+    # ── Tabs: Trender + Översikt ─────────────────────────────────────────
     st.markdown("---")
-    sf1, sf2 = st.columns(2)
+    tab_trends, tab_overview = st.tabs(["📈 Trender", "📊 Översikt"])
 
-    with sf1:
-        countries = sorted(df["Land"].unique())
-        sel_countries = st.multiselect("Land", countries, default=countries,
-                                       help="Filtrera analysen på specifika länder")
+    with tab_trends:
+        show_trends(df, filtered)
 
-    with sf2:
-        types = sorted(df["Typ"].dropna().unique()) if "Typ" in df.columns else []
-        if types:
-            sel_types = st.multiselect("Typ", types, default=types,
-                                       help="Utgående, Retur, Övrigt")
+    with tab_overview:
+        # ── Shipment-level filters ───────────────────────────────────────
+        sf1, sf2 = st.columns(2)
 
-    # Apply shipment-level filters
-    df = df[df["Land"].isin(sel_countries)]
-    if types and sel_types:
-        df = df[df["Typ"].isin(sel_types)]
+        with sf1:
+            countries = sorted(df["Land"].unique())
+            sel_countries = st.multiselect("Land", countries, default=countries,
+                                           help="Filtrera analysen på specifika länder")
 
-    if df.empty:
-        st.warning("Inga sändningar matchar filtret.")
-        return
+        with sf2:
+            types = sorted(df["Typ"].dropna().unique()) if "Typ" in df.columns else []
+            if types:
+                sel_types = st.multiselect("Typ", types, default=types,
+                                           help="Utgående, Retur, Övrigt")
 
-    # Recalculate invoice total for filtered view
-    filters_active = sel_countries != countries or (types and sel_types != types)
-    if filters_active:
-        total_inv = None
+        # Apply shipment-level filters
+        df_filtered = df[df["Land"].isin(sel_countries)].copy()
+        if types and sel_types:
+            df_filtered = df_filtered[df_filtered["Typ"].isin(sel_types)]
 
-    st.markdown("---")
+        if df_filtered.empty:
+            st.warning("Inga sändningar matchar filtret.")
+        else:
+            # Recalculate invoice total for filtered view
+            filters_active = sel_countries != countries or (types and sel_types != types)
+            total_inv_view = None if filters_active else total_inv
 
-    # Load overhead from stored invoices (skip if shipment filters active)
-    all_overhead = []
-    if not filters_active:
-        for _, inv_row in filtered.iterrows():
-            oh_json = inv_row.get("overhead")
-            if oh_json and isinstance(oh_json, str):
-                try:
-                    all_overhead.extend(json.loads(oh_json))
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            # Load overhead from stored invoices (skip if shipment filters active)
+            all_overhead = []
+            if not filters_active:
+                for _, inv_row in filtered.iterrows():
+                    oh_json = inv_row.get("overhead")
+                    if oh_json and isinstance(oh_json, str):
+                        try:
+                            all_overhead.extend(json.loads(oh_json))
+                        except (json.JSONDecodeError, TypeError):
+                            pass
 
-    show_analysis(df, invoice_total=total_inv, n_files=len(filtered), overhead=all_overhead if all_overhead else None)
+            show_analysis(df_filtered, invoice_total=total_inv_view, n_files=len(filtered),
+                          overhead=all_overhead if all_overhead else None)
 
     # ── Delete invoice ───────────────────────────────────────────────────
     st.markdown("---")
